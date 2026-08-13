@@ -10,7 +10,7 @@ const { attachVoiceBridge } = require('./lib/realtimeBridge');
 const { getCallSummaryText } = require('./lib/store');
 const { renderSummaryPdf } = require('./lib/pdfSummary');
 const { getRecentEvents } = require('./lib/activityLog');
-const { generateRcsDeeplink, addRcsTestDevice } = require('./lib/vonageApi');
+const { generateRcsDeeplink, addRcsTestDevice, listRcsAgents } = require('./lib/vonageApi');
 const { logEvent, redactPhone } = require('./lib/activityLog');
 const config = require('./lib/businessConfig');
 
@@ -103,6 +103,20 @@ app.get('/api/rcs-deeplink', async (req, res) => {
   }
 });
 
+// --- Debug-only: list RCS agents to find the real internal agent_id ---
+// (the test-devices endpoint rejected the human-readable sender_id
+// "henry_rcs_demo3" with "RCS Wizard Not Found" — this route exists to
+// look up the correct id once, not meant to stay linked from the frontend.)
+app.get('/api/rcs-agents', async (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  try {
+    const result = await listRcsAgents();
+    res.status(result.ok ? 200 : 502).json(result.json);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // --- Register a visitor's phone number as an RCS test device (demo.html) ---
 // The RCS agent isn't fully launched with carriers/Google yet, so Google
 // Messages refuses to open a chat with it for anyone except numbers
@@ -126,7 +140,7 @@ app.post('/api/rcs-test-device', async (req, res) => {
     }
     const phoneNumber = normalizeToE164(raw, config.RCS_DEEPLINK_COUNTRY);
     const result = await addRcsTestDevice({
-      agentId: config.RCS_AGENT_SENDER_ID,
+      agentId: config.RCS_AGENT_ID_CM,
       phoneNumber,
       country: config.RCS_DEEPLINK_COUNTRY,
     });
