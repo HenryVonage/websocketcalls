@@ -10,8 +10,22 @@ const { attachVoiceBridge } = require('./lib/realtimeBridge');
 const { getCallSummaryText } = require('./lib/store');
 const { renderSummaryPdf } = require('./lib/pdfSummary');
 const { getRecentEvents } = require('./lib/activityLog');
-const { generateRcsDeeplink } = require('./lib/vonageApi');
+const { generateRcsDeeplink, addRcsTestDevice } = require('./lib/vonageApi');
+const { logEvent, redactPhone } = require('./lib/activityLog');
 const config = require('./lib/businessConfig');
+
+// Turns whatever format a visitor typed (spaces, leading 0, etc.) into
+// E.164 for the Channel Manager API. Only handles the GB case explicitly
+// (this demo's default country) — anything already starting with "+" is
+// passed through as-is.
+function normalizeToE164(input, defaultCountry) {
+  const cleaned = String(input || '').replace(/[^\d+]/g, '');
+  if (cleaned.startsWith('+')) return cleaned;
+  if (defaultCountry === 'GB' && cleaned.startsWith('0')) {
+    return `+44${cleaned.slice(1)}`;
+  }
+  return `+${cleaned}`;
+}
 
 // Scans a Channel Manager API response for the deep link URL. Field name
 // isn't documented publicly as of this writing, so rather than guessing one
@@ -85,6 +99,48 @@ app.get('/api/rcs-deeplink', async (req, res) => {
     res.json({ url, raw: result.json });
   } catch (err) {
     console.error('GET /api/rcs-deeplink error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- Register a visitor's phone number as an RCS test device (demo.html) ---
+// The RCS agent isn't fully launched with carriers/Google yet, so Google
+// Messages refuses to open a chat with it for anyone except numbers
+// explicitly allow-listed here — even though the deep link itself works
+// fine for everyone. This is a demo-only convenience: it lets a visitor
+// register themselves as a tester right before scanning, instead of
+// needing that done manually in the Vonage dashboard ahead of time.
+app.options('/api/rcs-test-device', (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type');
+  res.status(204).end();
+});
+app.post('/api/rcs-test-device', async (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  try {
+    const raw = String(req.body?.phoneNumber || '').trim();
+    if (!raw) {
+      res.status(400).json({ error: 'phoneNumber is required' });
+      return;
+    }
+    const phoneNumber = normalizeToE164(raw, config.RCS_DEEPLINK_COUNTRY);
+    const result = await addRcsTestDevice({
+      agentId: config.RCS_AGENT_SENDER_ID,
+      phoneNumber,
+      country: config.RCS_DEEPLINK_COUNTRY,
+    });
+    logEvent(
+      result.ok ? 'call' : 'dlr',
+      `RCS test-device registration for ${redactPhone(phoneNumber)}: ${result.ok ? 'accepted' : `failed (${result.status})`}`
+    );
+    if (!result.ok) {
+      res.status(502).json({ error: 'Vonage Channel Manager API error', details: result.json });
+      return;
+    }
+    res.json({ ok: true, raw: result.json });
+  } catch (err) {
+    console.error('POST /api/rcs-test-device error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
