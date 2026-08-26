@@ -54,6 +54,19 @@ app.use(express.json());
 // instead of Render's internal proxy IP for every single request.
 app.set('trust proxy', 1);
 
+// TEMPORARY DIAGNOSTIC — logs every incoming request (method, path, and a
+// couple of headers) so we can see whether Vonage's WhatsApp Calling is
+// hitting this server at all, and on what path, while tracking down why
+// inbound WhatsApp calls aren't reaching /answer. Safe to remove once the
+// call flow is confirmed working — read-only, doesn't touch the response.
+app.use((req, res, next) => {
+  console.log('>>> INCOMING REQUEST', req.method, req.originalUrl, JSON.stringify({
+    'content-type': req.headers['content-type'],
+    'user-agent': req.headers['user-agent'],
+  }));
+  next();
+});
+
 // --- Rate limiters ---
 // Applied only to the public, unauthenticated demo-frontend endpoints —
 // not to Vonage's own inbound webhooks (messaging/voice/DLR), which need
