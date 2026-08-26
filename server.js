@@ -1,6 +1,7 @@
 const express = require('express');
 const http = require('http');
 const { WebSocketServer } = require('ws');
+const rateLimit = require('express-rate-limit');
 
 const { handleWhatsAppInbound } = require('./lib/whatsappFlow');
 const { handleRcsInbound } = require('./lib/rcsFlow');
@@ -48,6 +49,50 @@ function findDeeplinkUrl(value, seen = new Set()) {
 const app = express();
 app.use(express.json());
 
+// Render sits behind a proxy — required so express-rate-limit (and any
+// other req.ip usage) sees the real visitor IP via X-Forwarded-For
+// instead of Render's internal proxy IP for every single request.
+app.set('trust proxy', 1);
+
+// TEMPORARY DIAGNOSTIC — logs every incoming request (method, path, and a
+// couple of headers) so we can see whether Vonage's WhatsApp Calling is
+// hitting this server at all, and on what path, while tracking down why
+// inbound WhatsApp calls aren't reaching /answer. Safe to remove once the
+// call flow is confirmed working — read-only, doesn't touch the response.
+app.use((req, res, next) => {
+  console.log('>>> INCOMING REQUEST', req.method, req.originalUrl, JSON.stringify({
+    'content-type': req.headers['content-type'],
+    'user-agent': req.headers['user-agent'],
+  }));
+  next();
+});
+
+// --- Rate limiters ---
+// Applied only to the public, unauthenticated demo-frontend endpoints —
+// not to Vonage's own inbound webhooks (messaging/voice/DLR), which need
+// to reliably accept traffic regardless of volume.
+//
+// 5 per 15 min: a real visitor only ever needs to register once or twice;
+// this just stops the endpoint being scripted to spam arbitrary numbers
+// with Google's RCS tester SMS invite.
+const testerDeviceLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many registration attempts from this device. Please try again in a few minutes.' },
+});
+
+// 50 per minute: generous enough for normal demo-page traffic (both hit
+// automatically on page load) while still blocking scripted abuse.
+const publicApiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 50,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests. Please try again shortly.' },
+});
+
 // --- Inbound messaging (Flow 3, + the RCS demo) ---
 // Both demos share the same Vonage Application, and a Vonage Application
 // has a single inbound-message webhook URL covering every channel enabled
@@ -73,7 +118,7 @@ app.post('/vonage-dlr-status', handleDlr);
 // --- Public, redacted activity feed for the demo frontend's logs page ---
 // (CORS-open since it's fetched cross-origin from GitHub Pages; safe to be
 // public since entries are pre-redacted at the point they're logged.)
-app.get('/api/logs', (req, res) => {
+app.get('/api/logs', publicApiLimiter, (req, res) => {
   res.set('Access-Control-Allow-Origin', '*');
   res.json({ events: getRecentEvents() });
 });
@@ -84,7 +129,7 @@ app.get('/api/logs', (req, res) => {
 // than having the frontend hand-build an sms: URI. Falls back cleanly if
 // VONAGE_API_KEY/SECRET aren't configured yet — the frontend keeps using
 // its own client-built link in that case.
-app.get('/api/rcs-deeplink', async (req, res) => {
+app.get('/api/rcs-deeplink', publicApiLimiter, async (req, res) => {
   res.set('Access-Control-Allow-Origin', '*');
   try {
     const result = await generateRcsDeeplink({
@@ -130,7 +175,7 @@ app.options('/api/rcs-test-device', (req, res) => {
   res.set('Access-Control-Allow-Headers', 'Content-Type');
   res.status(204).end();
 });
-app.post('/api/rcs-test-device', async (req, res) => {
+app.post('/api/rcs-test-device', testerDeviceLimiter, async (req, res) => {
   res.set('Access-Control-Allow-Origin', '*');
   try {
     const raw = String(req.body?.phoneNumber || '').trim();
@@ -147,7 +192,7 @@ app.post('/api/rcs-test-device', async (req, res) => {
     logEvent(
       result.ok ? 'call' : 'dlr',
       `RCS test-device registration for ${redactPhone(phoneNumber)}: ${result.ok ? 'accepted' : `failed (${result.status})`}`
-    );
+      );
     if (!result.ok) {
       res.status(502).json({ error: 'Vonage Channel Manager API error', details: result.json });
       return;
