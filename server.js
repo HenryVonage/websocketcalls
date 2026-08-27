@@ -123,6 +123,35 @@ app.get('/api/logs', publicApiLimiter, (req, res) => {
   res.json({ events: getRecentEvents() });
 });
 
+// --- RCS launch redirect for the demo frontend's QR code / Open button ---
+// Same trick as wa.me for the WhatsApp demos: several QR scanner apps
+// (confirmed first-hand — reproduced with a widely-used Android barcode
+// reader) don't recognize a raw sms:... URI as a launchable chat invite
+// when it's scanned directly — they just show it as inert text or a
+// generic "Send SMS" card, ignoring the bot-name/body params entirely.
+// A plain https:// URL is recognized as a normal web link by literally
+// every scanner, so the QR/Open link points here instead; this then
+// 302-redirects to the real sms: URI, and the *browser* (not the scanner
+// app) hands that off to the OS's own scheme resolution — which does
+// correctly route it to Messages/RBM with the message pre-filled, the
+// same way it reliably does for wa.me -> whatsapp:// already.
+app.get('/rcs-launch', publicApiLimiter, (req, res) => {
+  const to = String(req.query.to || '').trim();
+  const bot = String(req.query.bot || '').trim().slice(0, 100);
+  const body = String(req.query.body || '').trim().slice(0, 500);
+  if (!to) {
+    res.status(400).send('Missing "to" (RCS service_id) query parameter.');
+    return;
+  }
+  // service_id must stay literal in the URI (not URI-encoded) — encoding
+  // the "@" breaks Android/Messages' recognition of it as an RBM agent
+  // address (confirmed by testing: it fell back to treating the whole
+  // string as a garbled SMS recipient). Only the query param *values*
+  // (bot-name, body) get encoded, mirroring demo.html's own builder.
+  const target = `sms:${to}?bot-name=${encodeURIComponent(bot)}&body=${encodeURIComponent(body)}`;
+  res.redirect(302, target);
+});
+
 // --- RCS deep link for the demo frontend's QR code (see demo.html) ---
 // Generates the link via Vonage's Channel Manager API (the officially
 // supported route, which Android's native Camera app recognizes) rather
