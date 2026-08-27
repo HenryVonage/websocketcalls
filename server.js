@@ -135,6 +135,17 @@ app.get('/api/logs', publicApiLimiter, (req, res) => {
 // app) hands that off to the OS's own scheme resolution — which does
 // correctly route it to Messages/RBM with the message pre-filled, the
 // same way it reliably does for wa.me -> whatsapp:// already.
+// Minimal HTML-escaping / JS-string-escaping for the tiny landing page
+// below — the only untrusted input reflected into it is the query params
+// this same route reads (to/bot/body), so this doesn't need to be a full
+// sanitizer, just correct for the characters those can contain.
+function htmlEscape(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+function jsStringEscape(s) {
+  return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/</g, '\\x3c');
+}
+
 app.get('/rcs-launch', publicApiLimiter, (req, res) => {
   const to = String(req.query.to || '').trim();
   const bot = String(req.query.bot || '').trim().slice(0, 100);
@@ -149,7 +160,41 @@ app.get('/rcs-launch', publicApiLimiter, (req, res) => {
   // string as a garbled SMS recipient). Only the query param *values*
   // (bot-name, body) get encoded, mirroring demo.html's own builder.
   const target = `sms:${to}?bot-name=${encodeURIComponent(bot)}&body=${encodeURIComponent(body)}`;
-  res.redirect(302, target);
+
+  // A bare 302 (the first version of this route) turned out not to be
+  // enough — confirmed on a real device: a third-party QR scanner app's
+  // "Open" button opened this URL, followed the redirect, and then did
+  // nothing. Most mobile browsers only allow navigating to a custom
+  // scheme (sms:, whatsapp:, etc.) off a *direct* user tap — an
+  // automatic redirect with no click inside the destination page itself
+  // doesn't count as that gesture, so the scheme navigation gets
+  // silently dropped. wa.me and virtually every other click-to-chat
+  // service solve this the same way: serve a real 200 landing page that
+  // both attempts an immediate JS redirect (works wherever that's
+  // allowed) and shows a plainly tappable fallback link (works
+  // everywhere else, since tapping it *is* the required gesture).
+  res.set('Content-Type', 'text/html; charset=utf-8');
+  res.send(`<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Opening Messages…</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #10254d; color: #fff; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 24px; text-align: center; }
+  p { opacity: 0.85; font-size: 14px; max-width: 320px; margin: 8px 0; }
+  a.btn { display: inline-block; margin-top: 20px; background: #fff; color: #10254d; font-weight: 600; padding: 14px 28px; border-radius: 8px; text-decoration: none; font-size: 16px; }
+</style>
+</head>
+<body>
+  <p>Opening Messages…</p>
+  <a class="btn" href="${htmlEscape(target)}">Tap here if it doesn't open automatically</a>
+  <p>If nothing happens within a second or two, tap the button above.</p>
+  <script>
+    window.location.href = "${jsStringEscape(target)}";
+  </script>
+</body>
+</html>`);
 });
 
 // --- RCS deep link for the demo frontend's QR code (see demo.html) ---
