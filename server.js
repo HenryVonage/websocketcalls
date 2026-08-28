@@ -4,6 +4,7 @@ const { WebSocketServer } = require('ws');
 const rateLimit = require('express-rate-limit');
 
 const { handleWhatsAppInbound } = require('./lib/whatsappFlow');
+const { processTicketingWhatsapp } = require('./lib/ticketingWhatsappFlow');
 const { handleRcsInbound } = require('./lib/rcsFlow');
 const { handleAnswer, handleEvents } = require('./lib/voiceHandlers');
 const { handleDlr } = require('./lib/dlrHandler');
@@ -19,6 +20,14 @@ const config = require('./lib/businessConfig');
 // E.164 for the Channel Manager API. Only handles the GB case explicitly
 // (this demo's default country) — anything already starting with "+" is
 // passed through as-is.
+// Strips everything but digits, so "447312277021", "+447312277021" and
+// "44 7312 277021" all compare equal — used to match the inbound
+// webhook's `to` field (a WhatsApp Business number) against config values
+// without worrying about which of those forms Vonage sends.
+function normalizeNumber(n) {
+  return String(n || '').replace(/\D/g, '');
+}
+
 function normalizeToE164(input, defaultCountry) {
   const cleaned = String(input || '').replace(/[^\d+]/g, '');
   if (cleaned.startsWith('+')) return cleaned;
@@ -102,6 +111,13 @@ const publicApiLimiter = rateLimit({
 app.post('/vonage-estate-whatsapp', (req, res) => {
   if (req.body?.channel === 'rcs') {
     handleRcsInbound(req, res);
+  } else if (normalizeNumber(req.body?.to) === normalizeNumber(config.TICKETING.WHATSAPP.FROM_WHATSAPP)) {
+    // Dedicated WABA number for the Ticketing WhatsApp demo (4th demo) —
+    // told apart from the Real Estate WhatsApp demo purely by which
+    // number the visitor messaged, not by greeting text (see
+    // lib/ticketingWhatsappFlow.js's header comment for why that's more
+    // reliable here than the two RCS demos' keyword-in-greeting trick).
+    processTicketingWhatsapp(req, res);
   } else {
     handleWhatsAppInbound(req, res);
   }
