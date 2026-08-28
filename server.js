@@ -201,14 +201,22 @@ app.get('/rcs-launch', publicApiLimiter, (req, res) => {
 // Generates the link via Vonage's Channel Manager API (the officially
 // supported route, which Android's native Camera app recognizes) rather
 // than having the frontend hand-build an sms: URI. Falls back cleanly if
-// VONAGE_API_KEY/SECRET aren't configured yet — the frontend keeps using
-// its own client-built link in that case.
+// VONAGE_API_KEY/SECRET aren't configured yet, or if this call itself
+// fails — the frontend keeps using its own client-built link in that
+// case (see demo.html's fetchOfficialRcsDeeplink()).
+//
+// ?body= carries the same prefilled greeting text demo.html would
+// otherwise embed in its own sms: URI — demoRouter.js still needs that
+// text to arrive with the visitor's first inbound message so it can tell
+// which demo (Ticketing vs Real Estate) they came from.
 app.get('/api/rcs-deeplink', publicApiLimiter, async (req, res) => {
   res.set('Access-Control-Allow-Origin', '*');
   try {
+    const prefilledMessage = String(req.query.body || '').trim().slice(0, 3072);
     const result = await generateRcsDeeplink({
       senderId: config.RCS_AGENT_SENDER_ID,
       country: config.RCS_DEEPLINK_COUNTRY,
+      prefilledMessage: prefilledMessage || undefined,
     });
     if (!result.ok) {
       res.status(502).json({ error: 'Vonage Channel Manager API error', details: result.json });
