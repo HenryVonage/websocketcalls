@@ -10,7 +10,7 @@ const { DEMOS, detectDemoFromText, resolveDemo } = require('./lib/demoRouter');
 const { handleAnswer, handleEvents } = require('./lib/voiceHandlers');
 const { handleDlr } = require('./lib/dlrHandler');
 const { attachVoiceBridge } = require('./lib/realtimeBridge');
-const { getCallSummaryText, setActiveDemo } = require('./lib/store');
+const { getCallSummaryText, setActiveDemo, initStore } = require('./lib/store');
 const { renderSummaryPdf } = require('./lib/pdfSummary');
 const { getRecentEvents } = require('./lib/activityLog');
 const { generateRcsDeeplink, addRcsTestDevice, listRcsAgents } = require('./lib/vonageApi');
@@ -379,6 +379,16 @@ server.on('upgrade', (req, socket, head) => {
 wss.on('connection', attachVoiceBridge);
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Vonage Estate server listening on port ${PORT}`);
-});
+// Hydrate store.js's Maps from Redis (if REDIS_URL is set) before accepting
+// any webhook, so a restart never serves a request against half-restored
+// state. Starts listening either way — a Redis hiccup falls back to
+// in-memory-only rather than blocking the server from coming up at all.
+initStore()
+  .catch((err) => {
+    console.error('Store: initStore() failed, starting with in-memory state only:', err.message);
+  })
+  .then(() => {
+    server.listen(PORT, () => {
+      console.log(`Vonage Estate server listening on port ${PORT}`);
+    });
+  });
