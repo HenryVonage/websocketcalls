@@ -373,15 +373,32 @@ app.get('/admin/whatsapp-templates', async (req, res) => {
   }
   try {
     const { generateVonageJwt } = require('./lib/vonageJwt');
-    const vonageRes = await fetch(`https://api.nexmo.com/v2/whatsapp-manager/wabas/${encodeURIComponent(wabaId)}/templates`, {
-      headers: { Authorization: `Bearer ${generateVonageJwt()}` },
-    });
-    const body = await vonageRes.json().catch(() => ({}));
-    if (!vonageRes.ok) {
-      res.status(vonageRes.status).json(body);
-      return;
+    // The templates list is paginated (default limit 25, max 500) via a
+    // paging.cursors.after / paging.next field — our very first version of
+    // this route ignored that entirely and just returned page 1, which
+    // silently truncated accounts with more than 25 templates (this WABA
+    // has 25+). Ask for the max page size and follow `after` cursors until
+    // exhausted, with a hard cap of 20 pages as a runaway-loop guard.
+    const templates = [];
+    let after = null;
+    for (let page = 0; page < 20; page += 1) {
+      const url = new URL(`https://api.nexmo.com/v2/whatsapp-manager/wabas/${encodeURIComponent(wabaId)}/templates`);
+      url.searchParams.set('limit', '500');
+      if (after) url.searchParams.set('after', after);
+      const vonageRes = await fetch(url, {
+        headers: { Authorization: `Bearer ${generateVonageJwt()}` },
+      });
+      const body = await vonageRes.json().catch(() => ({}));
+      if (!vonageRes.ok) {
+        res.status(vonageRes.status).json(body);
+        return;
+      }
+      for (const t of (body.templates || [])) {
+        templates.push({ name: t.name, language: t.language, status: t.status, category: t.category });
+      }
+      after = body.paging?.cursors?.after || null;
+      if (!after || !body.paging?.next) break;
     }
-    const templates = (body.templates || []).map((t) => ({ name: t.name, language: t.language, status: t.status, category: t.category }));
     res.status(200).json({ waba: wabaId, count: templates.length, templates });
   } catch (err) {
     res.status(500).json({ error: err.message });
