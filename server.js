@@ -358,6 +358,36 @@ app.get('/', (req, res) => {
   res.send('Vonage Estate server is running.');
 });
 
+// Diagnostic-only: lists the message templates Vonage/Meta actually has on
+// file for a given WhatsApp Business Account (WABA), with their approval
+// status per language — settles "is henry_ticketing3 really approved on
+// this number's WABA" from real data instead of guesswork. Pass the WABA
+// id from Vonage's dashboard (Messages API -> External Accounts) as
+// ?waba=<id>. Returns only template metadata (name/language/status/
+// category), nothing sensitive.
+app.get('/admin/whatsapp-templates', async (req, res) => {
+  const wabaId = req.query.waba;
+  if (!wabaId) {
+    res.status(400).json({ error: 'Pass the WABA id as ?waba=<id> (find it in the Vonage dashboard under Messages API -> External Accounts).' });
+    return;
+  }
+  try {
+    const { generateVonageJwt } = require('./lib/vonageJwt');
+    const vonageRes = await fetch(`https://api.nexmo.com/v2/whatsapp-manager/wabas/${encodeURIComponent(wabaId)}/templates`, {
+      headers: { Authorization: `Bearer ${generateVonageJwt()}` },
+    });
+    const body = await vonageRes.json().catch(() => ({}));
+    if (!vonageRes.ok) {
+      res.status(vonageRes.status).json(body);
+      return;
+    }
+    const templates = (body.templates || []).map((t) => ({ name: t.name, language: t.language, status: t.status, category: t.category }));
+    res.status(200).json({ waba: wabaId, count: templates.length, templates });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 const server = http.createServer(app);
 
 // The realtime audio connection (Flow 6 replacement) needs raw
