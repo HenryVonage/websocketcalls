@@ -6,6 +6,7 @@ const rateLimit = require('express-rate-limit');
 const { handleWhatsAppInbound } = require('./lib/whatsappFlow');
 const { processTicketingWhatsapp } = require('./lib/ticketingWhatsappFlow');
 const { handleRcsInbound } = require('./lib/rcsFlow');
+const { DEMOS, detectDemoFromText, resolveDemo } = require('./lib/demoRouter');
 const { handleAnswer, handleEvents } = require('./lib/voiceHandlers');
 const { handleDlr } = require('./lib/dlrHandler');
 const { attachVoiceBridge } = require('./lib/realtimeBridge');
@@ -109,14 +110,38 @@ const publicApiLimiter = rateLimit({
 // body.channel, rather than needing a second URL configured in the
 // dashboard. Route name kept as-is to avoid a webhook reconfiguration.
 app.post('/vonage-estate-whatsapp', (req, res) => {
-  if (req.body?.channel === 'rcs') {
+  const body = req.body || {};
+
+  if (body.channel === 'rcs') {
     handleRcsInbound(req, res);
-  } else if (normalizeNumber(req.body?.to) === normalizeNumber(config.TICKETING.WHATSAPP.FROM_WHATSAPP)) {
-    // Dedicated WABA number for the Ticketing WhatsApp demo (4th demo) —
-    // told apart from the Real Estate WhatsApp demo purely by which
-    // number the visitor messaged, not by greeting text (see
-    // lib/ticketingWhatsappFlow.js's header comment for why that's more
-    // reliable here than the two RCS demos' keyword-in-greeting trick).
+    return;
+  }
+
+  // WhatsApp. The Ticketing demo currently shares the Real Estate demo's
+  // WABA number (config.FROM_WHATSAPP) rather than a genuinely dedicated
+  // one — 447312277021 was never actually linked to this Vonage
+  // Application, so nothing ever reached this route for it (confirmed via
+  // Render logs: zero inbound webhooks, not a template-send failure).
+  //
+  // If a truly dedicated Ticketing WhatsApp number ever IS linked here
+  // later (config.TICKETING.WHATSAPP.FROM_WHATSAPP no longer equal to
+  // config.FROM_WHATSAPP), routing by `to` is unambiguous and preferred —
+  // checked first. Otherwise, fall back to the same greeting-text
+  // detection the two RCS demos already use to share one agent
+  // (lib/demoRouter.js) — resolveDemo() both decides AND remembers the
+  // choice per phone number, which lib/voiceHandlers.js's calling routing
+  // also depends on for this same shared-number ambiguity.
+  const dedicatedTicketingNumber = config.TICKETING.WHATSAPP.FROM_WHATSAPP;
+  const hasDedicatedNumber = normalizeNumber(dedicatedTicketingNumber) !== normalizeNumber(config.FROM_WHATSAPP);
+
+  if (hasDedicatedNumber && normalizeNumber(body.to) === normalizeNumber(dedicatedTicketingNumber)) {
+    processTicketingWhatsapp(req, res);
+    return;
+  }
+
+  const messageText = body.text ?? body.button?.text ?? body.button?.payload ?? '';
+  const demo = resolveDemo(body.from, messageText);
+  if (demo === DEMOS.TICKETING) {
     processTicketingWhatsapp(req, res);
   } else {
     handleWhatsAppInbound(req, res);
