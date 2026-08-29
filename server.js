@@ -4,13 +4,13 @@ const { WebSocketServer } = require('ws');
 const rateLimit = require('express-rate-limit');
 
 const { handleWhatsAppInbound } = require('./lib/whatsappFlow');
-const { processTicketingWhatsapp } = require('./lib/ticketingWhatsappFlow');
+const { processTicketingWhatsapp, TICKETING_REPLY_IDS } = require('./lib/ticketingWhatsappFlow');
 const { handleRcsInbound } = require('./lib/rcsFlow');
 const { DEMOS, detectDemoFromText, resolveDemo } = require('./lib/demoRouter');
 const { handleAnswer, handleEvents } = require('./lib/voiceHandlers');
 const { handleDlr } = require('./lib/dlrHandler');
 const { attachVoiceBridge } = require('./lib/realtimeBridge');
-const { getCallSummaryText } = require('./lib/store');
+const { getCallSummaryText, setActiveDemo } = require('./lib/store');
 const { renderSummaryPdf } = require('./lib/pdfSummary');
 const { getRecentEvents } = require('./lib/activityLog');
 const { generateRcsDeeplink, addRcsTestDevice, listRcsAgents } = require('./lib/vonageApi');
@@ -140,6 +140,15 @@ app.post('/vonage-estate-whatsapp', (req, res) => {
   }
 
   const messageText = body.text ?? body.button?.text ?? body.button?.payload ?? '';
+  const replyId = body.interactive?.list_reply?.id ?? body.interactive?.button_reply?.id ?? body.reply?.id ?? null;
+  const isKnownTicketingReply = replyId != null && TICKETING_REPLY_IDS.has(replyId);
+
+  if (isKnownTicketingReply) {
+    setActiveDemo(body.from, DEMOS.TICKETING); // re-heal the binding for the rest of this conversation too
+    processTicketingWhatsapp(req, res);
+    return;
+  }
+
   const demo = resolveDemo(body.from, messageText);
   if (demo === DEMOS.TICKETING) {
     processTicketingWhatsapp(req, res);
