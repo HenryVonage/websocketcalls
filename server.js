@@ -16,6 +16,8 @@ const { getRecentEvents } = require('./lib/activityLog');
 const { generateRcsDeeplink, addRcsTestDevice, listRcsAgents } = require('./lib/vonageApi');
 const { logEvent, redactPhone } = require('./lib/activityLog');
 const config = require('./lib/businessConfig');
+const multer = require('multer');
+const { sendFeedbackEmail, isValidEmail } = require('./lib/feedbackMailer');
 
 // Turns whatever format a visitor typed (spaces, leading 0, etc.) into
 // E.164 for the Channel Manager API. Only handles the GB case explicitly
@@ -101,6 +103,38 @@ const publicApiLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many requests. Please try again shortly.' },
+});
+
+// 5 per 15 min per IP — this endpoint sends a real email to Henry's inbox
+// on every accepted submission, so it needs a tighter cap than ordinary
+// page-load traffic (same reasoning/limit as testerDeviceLimiter above).
+const feedbackLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many submissions from this device. Please try again in a few minutes.' },
+});
+
+// --- Feedback form uploads (photos/video attached to henryauthier@gmail.com) ---
+// Memory storage, not disk: files are only ever held long enough to attach
+// them to one outgoing email (see lib/feedbackMailer.js), never written to
+// disk or persisted anywhere. multer's own `fileSize` limit is per-file,
+// not per-request, so it's set generously here (12MB) and the *actual*
+// 10MB-total cap Henry asked for is enforced explicitly below, across all
+// files combined, after multer has parsed the request.
+const FEEDBACK_MAX_TOTAL_BYTES = 10 * 1024 * 1024;
+const FEEDBACK_ALLOWED_MIME = /^image\/(png|jpe?g)$|^video\//i;
+const feedbackUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 12 * 1024 * 1024, files: 5 },
+  fileFilter: (req, file, cb) => {
+    if (!FEEDBACK_ALLOWED_MIME.test(file.mimetype)) {
+      cb(new Error(`Unsupported file type: ${file.mimetype}. Only images (png/jpg/jpeg) and video are accepted.`));
+      return;
+    }
+    cb(null, true);
+  },
 });
 
 // --- Inbound messaging (Flow 3, + the RCS demo) ---
@@ -403,6 +437,48 @@ app.get('/admin/whatsapp-templates', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// --- Feedback form (bottom of demo.html — visitor comment/question,
+// optional photo/video attachments, notified to henryauthier@gmail.com) ---
+app.options('/api/feedback', (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type');
+  res.status(204).end();
+});
+app.post('/api/feedback', feedbackLimiter, (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  feedbackUpload.array('files', 5)(req, res, async (err) => {
+    if (err) {
+      // Covers both multer's own per-file-size/count limits and the
+      // fileFilter rejection above — either way this is a 400 (the
+      // visitor's request was invalid), not a 500.
+      res.status(400).json({ error: err.message });
+      return;
+    }
+    try {
+      const { name, email, message, demoLabel } = req.body || {};
+      if (!isValidEmail(email)) {
+        res.status(400).json({ error: 'Please enter a valid email address.' });
+        return;
+      }
+      const files = req.files || [];
+      const totalBytes = files.reduce((sum, f) => sum + f.size, 0);
+      if (totalBytes > FEEDBACK_MAX_TOTAL_BYTES) {
+        res.status(400).json({
+          error: `Attachments are too large (${(totalBytes / 1024 / 1024).toFixed(1)}MB) — please keep the total under 10MB.`,
+        });
+        return;
+      }
+      await sendFeedbackEmail({ name, email, message, demoLabel, files });
+      logEvent('inbound', `Feedback form submission from ${email}${files.length ? ` with ${files.length} attachment(s)` : ''}`);
+      res.json({ ok: true });
+    } catch (err) {
+      console.error('POST /api/feedback error:', err.message);
+      res.status(500).json({ error: 'Sorry, something went wrong sending your message. Please try again shortly.' });
+    }
+  });
 });
 
 const server = http.createServer(app);
