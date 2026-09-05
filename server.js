@@ -5,8 +5,11 @@ const rateLimit = require('express-rate-limit');
 
 const { handleWhatsAppInbound } = require('./lib/whatsappFlow');
 const { processTicketingWhatsapp, TICKETING_REPLY_IDS } = require('./lib/ticketingWhatsappFlow');
+const { handleMusicLoversInbound } = require('./lib/musicLoversFlow');
 const { handleRcsInbound } = require('./lib/rcsFlow');
 const { DEMOS, detectDemoFromText, resolveDemo } = require('./lib/demoRouter');
+const { getTrackPreviewUrl } = require('./lib/spotifyApi');
+const { buildRingtoneClip } = require('./lib/ringtoneBuilder');
 const { handleAnswer, handleEvents } = require('./lib/voiceHandlers');
 const { handleDlr } = require('./lib/dlrHandler');
 const { attachVoiceBridge } = require('./lib/realtimeBridge');
@@ -189,6 +192,8 @@ app.post('/vonage-estate-whatsapp', (req, res) => {
   const demo = resolveDemo(body.from, messageText);
   if (demo === DEMOS.TICKETING) {
     processTicketingWhatsapp(req, res);
+  } else if (demo === DEMOS.MUSIC_LOVERS) {
+    handleMusicLoversInbound(req, res);
   } else {
     handleWhatsAppInbound(req, res);
   }
@@ -388,6 +393,27 @@ app.get('/call-summary/:conversationUuid.pdf', async (req, res) => {
   } catch (err) {
     console.error('Failed to render call summary PDF:', err);
     res.status(500).send('Failed to generate PDF');
+  }
+});
+
+// --- Music Lovers ringtone clip, fetched by WhatsApp for the audio message
+// sent after a listener replies confirming the song is "...stuck in my
+// head..." (see lib/musicLoversFlow.js and demo-notes.md's "Ringtone
+// follow-up feature") ---
+app.get('/music-lovers/ringtone/:trackId.ogg', async (req, res) => {
+  const { trackId } = req.params;
+  try {
+    const previewUrl = await getTrackPreviewUrl(trackId);
+    if (!previewUrl) {
+      res.status(404).send('No Spotify preview available for this track (see lib/spotifyApi.js) — needs a royalty-free fallback clip, not yet built.');
+      return;
+    }
+    const clip = await buildRingtoneClip(trackId, previewUrl);
+    res.set('Content-Type', 'audio/ogg');
+    res.send(clip);
+  } catch (err) {
+    console.error('Failed to build Music Lovers ringtone clip:', err);
+    res.status(500).send('Failed to generate ringtone clip');
   }
 });
 
