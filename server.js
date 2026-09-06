@@ -21,7 +21,7 @@ const { generateRcsDeeplink, addRcsTestDevice, listRcsAgents } = require('./lib/
 const { logEvent, redactPhone } = require('./lib/activityLog');
 const config = require('./lib/businessConfig');
 const multer = require('multer');
-const { sendFeedbackEmail, isValidEmail } = require('./lib/feedbackMailer');
+const { sendFeedbackEmail, isValidEmail, sendSpotifyTesterRequestEmail } = require('./lib/feedbackMailer');
 
 // Turns whatever format a visitor typed (spaces, leading 0, etc.) into
 // E.164 for the Channel Manager API. Only handles the GB case explicitly
@@ -118,6 +118,16 @@ const feedbackLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many submissions from this device. Please try again in a few minutes.' },
+});
+
+// 5 per 15 min — same reasoning as feedbackLimiter above: this sends a real
+// email to Henry's inbox on every accepted submission.
+const spotifyTesterLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests from this device. Please try again in a few minutes.' },
 });
 
 // --- Feedback form uploads (photos/video attached to henryauthier@gmail.com) ---
@@ -564,6 +574,45 @@ app.post('/api/feedback', feedbackLimiter, (req, res) => {
       res.status(500).json({ error: 'Sorry, something went wrong sending your message. Please try again shortly.' });
     }
   });
+});
+
+// --- Spotify tester access request (music-lovers.html's Spotify Connect
+// block) — the app is in Spotify's Development Mode, so only accounts
+// Henry has manually added under its dashboard's User Management tab can
+// complete that OAuth flow (see lib/spotifyOAuth.js). Fired alongside the
+// actual connect attempt (client-side, via fetch with keepalive so it
+// survives the redirect to /api/spotify-auth-start right after) — this is
+// how an unknown visitor's email actually reaches Henry, since there's no
+// public Spotify API to add a tester automatically. ---
+app.options('/api/spotify-tester-request', (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type');
+  res.status(204).end();
+});
+app.post('/api/spotify-tester-request', spotifyTesterLimiter, async (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  try {
+    const name = String(req.body?.name || '').trim().slice(0, 60);
+    const email = String(req.body?.email || '').trim();
+    const rawPhone = String(req.body?.phone || '').trim();
+    if (!isValidEmail(email)) {
+      res.status(400).json({ error: 'A valid email address is required.' });
+      return;
+    }
+    const phone = rawPhone ? normalizeToE164(rawPhone, config.RCS_DEEPLINK_COUNTRY).replace(/^\+/, '') : '';
+    await sendSpotifyTesterRequestEmail({ name, email, phone });
+    logEvent('inbound', `Spotify tester access requested by ${email}${phone ? ` (${redactPhone(phone)})` : ''}`);
+    res.status(200).json({ status: 'received' });
+  } catch (err) {
+    console.error('POST /api/spotify-tester-request error:', err.message);
+    // Deliberately still 500s the visitor (rather than pretending success)
+    // if GMAIL_USER/GMAIL_APP_PASSWORD aren't set yet — same reasoning as
+    // /api/feedback above. The frontend swallows this either way (it's a
+    // fire-and-forget alongside the real connect attempt), but Render's
+    // logs need the real failure reason.
+    res.status(500).json({ error: 'Sorry, something went wrong requesting access. Please try again shortly.' });
+  }
 });
 
 const server = http.createServer(app);
