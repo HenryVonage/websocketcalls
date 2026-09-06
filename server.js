@@ -5,15 +5,16 @@ const rateLimit = require('express-rate-limit');
 
 const { handleWhatsAppInbound } = require('./lib/whatsappFlow');
 const { processTicketingWhatsapp, TICKETING_REPLY_IDS } = require('./lib/ticketingWhatsappFlow');
-const { handleMusicLoversInbound } = require('./lib/musicLoversFlow');
+const { handleMusicLoversInbound, handleSpotifyConnected } = require('./lib/musicLoversFlow');
 const { handleRcsInbound } = require('./lib/rcsFlow');
 const { DEMOS, detectDemoFromText, resolveDemo } = require('./lib/demoRouter');
 const { getTrackPreviewUrl } = require('./lib/spotifyApi');
+const spotifyOAuth = require('./lib/spotifyOAuth');
 const { buildRingtoneClip } = require('./lib/ringtoneBuilder');
 const { handleAnswer, handleEvents } = require('./lib/voiceHandlers');
 const { handleDlr } = require('./lib/dlrHandler');
 const { attachVoiceBridge } = require('./lib/realtimeBridge');
-const { getCallSummaryText, setActiveDemo, initStore } = require('./lib/store');
+const { getCallSummaryText, setActiveDemo, setCallerName, setSpotifyTokens, initStore } = require('./lib/store');
 const { renderSummaryPdf } = require('./lib/pdfSummary');
 const { getRecentEvents } = require('./lib/activityLog');
 const { generateRcsDeeplink, addRcsTestDevice, listRcsAgents } = require('./lib/vonageApi');
@@ -393,6 +394,61 @@ app.get('/call-summary/:conversationUuid.pdf', async (req, res) => {
   } catch (err) {
     console.error('Failed to render call summary PDF:', err);
     res.status(500).send('Failed to generate PDF');
+  }
+});
+
+// --- Music Lovers "Connect your Spotify" step (frontend/music-lovers.html)
+// — Authorization Code flow, see lib/spotifyOAuth.js for the full setup
+// requirements (redirect URI allow-listed in Spotify's dashboard, tester
+// accounts added under User Management while the app is in Development
+// Mode). Two-hop redirect: the frontend sends the listener here with their
+// phone/name (plain browser navigation, not a fetch — no CORS needed), we
+// bounce them to Spotify's own consent screen, Spotify calls back to
+// /api/spotify-callback below. ---
+app.get('/api/spotify-auth-start', (req, res) => {
+  const rawPhone = String(req.query.phone || '').trim();
+  const name = String(req.query.name || '').slice(0, 60);
+  if (!rawPhone) {
+    res.status(400).send('Missing phone number.');
+    return;
+  }
+  const phone = normalizeToE164(rawPhone, config.RCS_DEEPLINK_COUNTRY).replace(/^\+/, '');
+  try {
+    const state = spotifyOAuth.createPendingState(phone, name);
+    res.redirect(spotifyOAuth.getAuthorizeUrl(state));
+  } catch (err) {
+    console.error('Spotify auth-start failed:', err.message);
+    res.status(500).send('Spotify connect is not configured yet (missing SPOTIFY_CLIENT_ID / SPOTIFY_REDIRECT_URI) — see .env.example.');
+  }
+});
+
+app.get('/api/spotify-callback', async (req, res) => {
+  const { code, error, state } = req.query;
+  const pageBase = process.env.MUSIC_LOVERS_PAGE_URL || 'https://henryvonage.github.io/frontend/music-lovers.html';
+  if (error) {
+    logEvent('inbound', `Spotify consent declined: ${error}`);
+    res.redirect(`${pageBase}?spotify=denied`);
+    return;
+  }
+  const pending = state && spotifyOAuth.consumePendingState(String(state));
+  if (!pending) {
+    res.redirect(`${pageBase}?spotify=expired`);
+    return;
+  }
+  try {
+    const tokenResp = await spotifyOAuth.exchangeCodeForToken(String(code));
+    setSpotifyTokens(pending.phone, {
+      accessToken: tokenResp.access_token,
+      refreshToken: tokenResp.refresh_token,
+      expiresAt: Date.now() + tokenResp.expires_in * 1000,
+    });
+    if (pending.name) setCallerName(pending.phone, pending.name);
+    await handleSpotifyConnected(pending.phone, pending.name || 'there');
+    logEvent('inbound', `Spotify connected for ${redactPhone(pending.phone)}`);
+    res.redirect(`${pageBase}?spotify=connected`);
+  } catch (err) {
+    console.error('Spotify OAuth callback failed:', err.message);
+    res.redirect(`${pageBase}?spotify=error`);
   }
 });
 
