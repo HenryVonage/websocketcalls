@@ -10,7 +10,7 @@ const { handleRcsInbound } = require('./lib/rcsFlow');
 const { DEMOS, detectDemoFromText, resolveDemo } = require('./lib/demoRouter');
 const { getTrackPreviewUrl } = require('./lib/spotifyApi');
 const spotifyOAuth = require('./lib/spotifyOAuth');
-const { buildRingtoneClip } = require('./lib/ringtoneBuilder');
+const { buildRingtoneClip, isCached: isRingtoneCached } = require('./lib/ringtoneBuilder');
 const { handleAnswer, handleEvents } = require('./lib/voiceHandlers');
 const { handleDlr } = require('./lib/dlrHandler');
 const { attachVoiceBridge } = require('./lib/realtimeBridge');
@@ -453,9 +453,19 @@ app.get('/api/spotify-callback', async (req, res) => {
       expiresAt: Date.now() + tokenResp.expires_in * 1000,
     });
     if (pending.name) setCallerName(pending.phone, pending.name);
-    await handleSpotifyConnected(pending.phone, pending.name || 'there');
     logEvent('inbound', `Spotify connected for ${redactPhone(pending.phone)}`);
+    // Redirect the visitor's browser back to music-lovers.html immediately
+    // — every other webhook/callback in this codebase acks/responds first
+    // and does its own follow-up work after, but this one previously
+    // awaited a Spotify top-artists fetch + a WhatsApp template send
+    // (1-3s) before redirecting at all, leaving the visitor staring at a
+    // blank onrender.com page mid-demo. handleSpotifyConnected already has
+    // its own try/catch and a fallback to the ordinary genre prompt, so
+    // firing it without awaiting is safe.
     res.redirect(`${pageBase}?spotify=connected`);
+    handleSpotifyConnected(pending.phone, pending.name || 'there').catch((err) => {
+      console.error('handleSpotifyConnected (post-redirect) failed:', err);
+    });
   } catch (err) {
     console.error('Spotify OAuth callback failed:', err.message);
     res.redirect(`${pageBase}?spotify=error`);
@@ -469,12 +479,21 @@ app.get('/api/spotify-callback', async (req, res) => {
 app.get('/music-lovers/ringtone/:trackId.ogg', async (req, res) => {
   const { trackId } = req.params;
   try {
-    const previewUrl = await getTrackPreviewUrl(trackId);
-    if (!previewUrl) {
-      res.status(404).send('No Spotify preview available for this track (see lib/spotifyApi.js) — needs a royalty-free fallback clip, not yet built.');
-      return;
+    // Skip the Spotify preview-URL lookup entirely on a cache hit — this
+    // route previously always did that fetch first even when the clip was
+    // already built, so the cache was only ever saving the ffmpeg step,
+    // not the network round-trip.
+    let clip;
+    if (isRingtoneCached(trackId)) {
+      clip = await buildRingtoneClip(trackId, null);
+    } else {
+      const previewUrl = await getTrackPreviewUrl(trackId);
+      if (!previewUrl) {
+        res.status(404).send('No Spotify preview available for this track (see lib/spotifyApi.js) — needs a royalty-free fallback clip, not yet built.');
+        return;
+      }
+      clip = await buildRingtoneClip(trackId, previewUrl);
     }
-    const clip = await buildRingtoneClip(trackId, previewUrl);
     res.set('Content-Type', 'audio/ogg');
     res.send(clip);
   } catch (err) {
