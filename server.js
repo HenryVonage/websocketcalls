@@ -8,13 +8,22 @@ const { processTicketingWhatsapp, TICKETING_REPLY_IDS } = require('./lib/ticketi
 const { handleMusicLoversInbound, handleSpotifyConnected } = require('./lib/musicLoversFlow');
 const { handleRcsInbound } = require('./lib/rcsFlow');
 const { DEMOS, detectDemoFromText, resolveDemo } = require('./lib/demoRouter');
-const { getTrackPreviewUrl } = require('./lib/spotifyApi');
+const { getTrackPreviewUrl, getPlaylistTracks } = require('./lib/spotifyApi');
 const spotifyOAuth = require('./lib/spotifyOAuth');
 const { buildRingtoneClip, isCached: isRingtoneCached } = require('./lib/ringtoneBuilder');
 const { handleAnswer, handleEvents } = require('./lib/voiceHandlers');
 const { handleDlr } = require('./lib/dlrHandler');
 const { attachVoiceBridge } = require('./lib/realtimeBridge');
-const { getCallSummaryText, setActiveDemo, setCallerName, setSpotifyTokens, initStore } = require('./lib/store');
+const {
+  getCallSummaryText,
+  setActiveDemo,
+  setCallerName,
+  setSpotifyTokens,
+  getSpotifyTokens,
+  setTopTracksCatalogForGenre,
+  getAllTopTracksCatalog,
+  initStore,
+} = require('./lib/store');
 const { renderSummaryPdf } = require('./lib/pdfSummary');
 const { getRecentEvents } = require('./lib/activityLog');
 const { generateRcsDeeplink, addRcsTestDevice, listRcsAgents } = require('./lib/vonageApi');
@@ -69,6 +78,29 @@ app.use(express.json());
 // other req.ip usage) sees the real visitor IP via X-Forwarded-For
 // instead of Render's internal proxy IP for every single request.
 app.set('trust proxy', 1);
+
+// Gates diagnostic/admin-only routes (the pre-existing /api/rcs-agents and
+// /admin/whatsapp-templates below, and the new Music Lovers playlist/catalog
+// routes further down) — previously /api/rcs-agents and
+// /admin/whatsapp-templates were public and unauthenticated: one lists
+// account-level RCS agents to anyone, the other inspects WhatsApp template
+// metadata for any WABA id someone passes in. Set ADMIN_TOKEN in Render's
+// env and pass it as ?admin_token=<value> (or an X-Admin-Token header) to
+// use any of these routes; unset, they stay closed rather than defaulting
+// open.
+function requireAdminToken(req, res, next) {
+  const configured = process.env.ADMIN_TOKEN;
+  if (!configured) {
+    res.status(503).json({ error: 'This diagnostic route is disabled — set ADMIN_TOKEN in the environment to enable it.' });
+    return;
+  }
+  const supplied = req.query.admin_token || req.headers['x-admin-token'];
+  if (supplied !== configured) {
+    res.status(401).json({ error: 'Missing or invalid admin token.' });
+    return;
+  }
+  next();
+}
 
 // TEMPORARY DIAGNOSTIC — logs every incoming request (method, path, and a
 // couple of headers) so we can see whether Vonage's WhatsApp Calling is
@@ -337,7 +369,7 @@ app.get('/api/rcs-deeplink', publicApiLimiter, async (req, res) => {
 // (the test-devices endpoint rejected the human-readable sender_id
 // "henry_rcs_demo3" with "RCS Wizard Not Found" — this route exists to
 // look up the correct id once, not meant to stay linked from the frontend.)
-app.get('/api/rcs-agents', async (req, res) => {
+app.get('/api/rcs-agents', requireAdminToken, async (req, res) => {
   res.set('Access-Control-Allow-Origin', '*');
   try {
     const result = await listRcsAgents();
@@ -416,6 +448,28 @@ app.get('/call-summary/:conversationUuid.pdf', async (req, res) => {
 // bounce them to Spotify's own consent screen, Spotify calls back to
 // /api/spotify-callback below. ---
 app.get('/api/spotify-auth-start', (req, res) => {
+  // One-time authorization for Henry's own account, separate from the
+  // phone-keyed visitor flow just below — lets the backend build
+  // TRACK_CATALOG from Henry's real Top Tracks (see
+  // /admin/music-lovers/refresh-top-tracks-catalog further down). Gated by
+  // the same ADMIN_TOKEN as the other diagnostic routes rather than a
+  // phone number, since there's no visitor session to key it to.
+  if (req.query.owner === '1') {
+    const configured = process.env.ADMIN_TOKEN;
+    const supplied = req.query.admin_token || req.headers['x-admin-token'];
+    if (!configured || supplied !== configured) {
+      res.status(401).send('Missing or invalid admin token.');
+      return;
+    }
+    try {
+      const state = spotifyOAuth.createPendingState(spotifyOAuth.OWNER_KEY, 'Henry (catalog owner)');
+      res.redirect(spotifyOAuth.getAuthorizeUrl(state));
+    } catch (err) {
+      console.error('Spotify owner auth-start failed:', err.message);
+      res.status(500).send('Spotify connect is not configured yet (missing SPOTIFY_CLIENT_ID / SPOTIFY_REDIRECT_URI) — see .env.example.');
+    }
+    return;
+  }
   const rawPhone = String(req.query.phone || '').trim();
   const name = String(req.query.name || '').slice(0, 60);
   if (!rawPhone) {
@@ -445,6 +499,7 @@ app.get('/api/spotify-callback', async (req, res) => {
     res.redirect(`${pageBase}?spotify=expired`);
     return;
   }
+  const isOwnerAuth = pending.phone === spotifyOAuth.OWNER_KEY;
   try {
     const tokenResp = await spotifyOAuth.exchangeCodeForToken(String(code));
     setSpotifyTokens(pending.phone, {
@@ -452,6 +507,14 @@ app.get('/api/spotify-callback', async (req, res) => {
       refreshToken: tokenResp.refresh_token,
       expiresAt: Date.now() + tokenResp.expires_in * 1000,
     });
+    if (isOwnerAuth) {
+      // Not a visitor session — nothing to redirect back to on
+      // music-lovers.html and no WhatsApp match to trigger. Plain
+      // confirmation is enough; the next step happens via the admin route.
+      logEvent('inbound', 'Spotify connected as Music Lovers catalog owner (Henry)');
+      res.send('Spotify connected as the Music Lovers catalog owner. You can close this tab, then call GET /admin/music-lovers/refresh-top-tracks-catalog?admin_token=... to build the genre catalog from your last-4-weeks Top Tracks.');
+      return;
+    }
     if (pending.name) setCallerName(pending.phone, pending.name);
     logEvent('inbound', `Spotify connected for ${redactPhone(pending.phone)}`);
     // Redirect the visitor's browser back to music-lovers.html immediately
@@ -468,6 +531,10 @@ app.get('/api/spotify-callback', async (req, res) => {
     });
   } catch (err) {
     console.error('Spotify OAuth callback failed:', err.message);
+    if (isOwnerAuth) {
+      res.status(500).send('Spotify owner authorization failed — check the Render logs and try again.');
+      return;
+    }
     res.redirect(`${pageBase}?spotify=error`);
   }
 });
@@ -513,7 +580,7 @@ app.get('/', (req, res) => {
 // id from Vonage's dashboard (Messages API -> External Accounts) as
 // ?waba=<id>. Returns only template metadata (name/language/status/
 // category), nothing sensitive.
-app.get('/admin/whatsapp-templates', async (req, res) => {
+app.get('/admin/whatsapp-templates', requireAdminToken, async (req, res) => {
   const wabaId = req.query.waba;
   if (!wabaId) {
     res.status(400).json({ error: 'Pass the WABA id as ?waba=<id> (find it in the Vonage dashboard under Messages API -> External Accounts).' });
@@ -551,6 +618,96 @@ app.get('/admin/whatsapp-templates', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// Diagnostic-only: dumps every track (id, name, artist(s), Spotify URL) in
+// a PUBLIC Spotify playlist, for building/expanding Music Lovers' genre
+// catalog (see musicLoversConfig.js's TRACK_CATALOG and demo-notes.md) —
+// not wired into any user-facing flow. Pass the playlist id from its
+// open.spotify.com/playlist/<id> URL as ?playlistId=<id>. Read-only,
+// app-only Client Credentials auth (see spotifyApi.js's getPlaylistTracks),
+// so it only works for playlists that are public.
+app.get('/admin/music-lovers/playlist-dump', requireAdminToken, async (req, res) => {
+  const playlistId = req.query.playlistId;
+  if (!playlistId) {
+    res.status(400).json({ error: 'Pass the playlist id as ?playlistId=<id> (from its open.spotify.com/playlist/<id> URL).' });
+    return;
+  }
+  try {
+    const tracks = await getPlaylistTracks(playlistId);
+    res.status(200).json({ playlistId, count: tracks.length, tracks });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Returns a valid access token for the Music Lovers catalog owner (Henry),
+// refreshing it first if it's expired (or about to be within 5s) — unlike
+// the visitor Spotify-connect flow, which only ever uses a freshly-issued
+// token once right after the OAuth callback, this token gets reused across
+// however long it's been since Henry last authorized, so it needs to
+// actually handle expiry rather than assume the access token is still
+// good. Throws if there's no owner authorization on file yet.
+async function getValidOwnerAccessToken() {
+  let tokens = getSpotifyTokens(spotifyOAuth.OWNER_KEY);
+  if (!tokens) {
+    throw new Error('No Spotify owner authorization on file yet — visit GET /api/spotify-auth-start?owner=1&admin_token=<ADMIN_TOKEN> first.');
+  }
+  if (tokens.expiresAt && tokens.expiresAt < Date.now() + 5000) {
+    if (!tokens.refreshToken) {
+      throw new Error('Owner Spotify token expired and no refresh token was stored — re-authorize via /api/spotify-auth-start?owner=1.');
+    }
+    const refreshed = await spotifyOAuth.refreshAccessToken(tokens.refreshToken);
+    tokens = {
+      accessToken: refreshed.access_token,
+      // Spotify doesn't always rotate the refresh token on a refresh call —
+      // keep the existing one when it doesn't.
+      refreshToken: refreshed.refresh_token || tokens.refreshToken,
+      expiresAt: Date.now() + refreshed.expires_in * 1000,
+    };
+    setSpotifyTokens(spotifyOAuth.OWNER_KEY, tokens);
+  }
+  return tokens.accessToken;
+}
+
+// Rebuilds the cached "genre -> candidate tracks" catalog musicLoversFlow.js
+// sends from (see store.js's topTracksCatalog / pickTrackForGenre), sourced
+// from Henry's own last-4-weeks Top Tracks (per his own instruction: match
+// the selected genre against his *recent* listening, not a one-time static
+// pick) — see spotifyOAuth.js's getTopTracksBucketedByGenre for the actual
+// per-track genre bucketing. Call this once after the owner authorizes
+// (above), and again any time Henry wants the catalog to reflect his
+// current listening. Writes every one of musicLoversConfig.GENRES, even
+// ones that got zero matches this run, so a genre that drops out of his
+// recent listening correctly falls back to the static TRACK_CATALOG entry
+// instead of serving a stale pick from a previous refresh.
+app.get('/admin/music-lovers/refresh-top-tracks-catalog', requireAdminToken, async (req, res) => {
+  try {
+    const musicConfig = require('./lib/musicLoversConfig');
+    const accessToken = await getValidOwnerAccessToken();
+    const byGenre = await spotifyOAuth.getTopTracksBucketedByGenre(accessToken, 'short_term');
+    const summary = {};
+    for (const genre of musicConfig.GENRES) {
+      const tracks = byGenre[genre] || [];
+      setTopTracksCatalogForGenre(genre, { tracks });
+      summary[genre] = {
+        matchCount: tracks.length,
+        picked: tracks[0] || null,
+        usingFallback: tracks.length === 0,
+      };
+    }
+    logEvent('inbound', `Music Lovers top-tracks catalog refreshed (${Object.values(summary).filter((s) => !s.usingFallback).length}/${musicConfig.GENRES.length} genres matched)`);
+    res.status(200).json({ timeRange: 'short_term (~last 4 weeks)', refreshedAt: new Date().toISOString(), genres: summary });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Read-only view of whatever /admin/music-lovers/refresh-top-tracks-catalog
+// last built, without triggering a new Spotify fetch — useful for checking
+// what's currently live without spending another refresh.
+app.get('/admin/music-lovers/top-tracks-catalog', requireAdminToken, (req, res) => {
+  res.status(200).json({ genres: getAllTopTracksCatalog() });
 });
 
 // --- Feedback form (bottom of demo.html — visitor comment/question,
