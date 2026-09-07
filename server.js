@@ -10,6 +10,7 @@ const { handleRcsInbound } = require('./lib/rcsFlow');
 const { DEMOS, detectDemoFromText, resolveDemo } = require('./lib/demoRouter');
 const { getTrackPreviewUrl, getPlaylistTracks } = require('./lib/spotifyApi');
 const spotifyOAuth = require('./lib/spotifyOAuth');
+const { searchVideoId } = require('./lib/youtubeApi');
 const { buildRingtoneClip, isCached: isRingtoneCached } = require('./lib/ringtoneBuilder');
 const { handleAnswer, handleEvents } = require('./lib/voiceHandlers');
 const { handleDlr } = require('./lib/dlrHandler');
@@ -681,6 +682,17 @@ async function getValidOwnerAccessToken() {
 // ones that got zero matches this run, so a genre that drops out of his
 // recent listening correctly falls back to the static TRACK_CATALOG entry
 // instead of serving a stale pick from a previous refresh.
+//
+// Also resolves a YouTube video id for each genre's picked (top) track via
+// lib/youtubeApi.js — Spotify has no YouTube mapping of its own, so this is
+// what keeps the "Watch on Youtube" button correct automatically as Henry's
+// Top Tracks change, instead of needing a manual video-ID lookup after every
+// refresh (Henry's own request). Only the picked track per genre is looked
+// up, not every candidate, to keep this to one YouTube API call per genre
+// (6 total) per refresh. A failed/skipped lookup (e.g. YOUTUBE_API_KEY not
+// set yet) leaves that track's youtubeVideoId unset here, and
+// pickTrackForGenre in musicLoversFlow.js falls back to the static
+// TRACK_CATALOG's placeholder for that field in that case.
 app.get('/admin/music-lovers/refresh-top-tracks-catalog', requireAdminToken, async (req, res) => {
   try {
     const musicConfig = require('./lib/musicLoversConfig');
@@ -689,10 +701,14 @@ app.get('/admin/music-lovers/refresh-top-tracks-catalog', requireAdminToken, asy
     const summary = {};
     for (const genre of musicConfig.GENRES) {
       const tracks = byGenre[genre] || [];
+      const top = tracks[0] || null;
+      if (top) {
+        top.youtubeVideoId = await searchVideoId(`${top.artist} - ${top.title}`);
+      }
       setTopTracksCatalogForGenre(genre, { tracks });
       summary[genre] = {
         matchCount: tracks.length,
-        picked: tracks[0] || null,
+        picked: top,
         usingFallback: tracks.length === 0,
       };
     }
