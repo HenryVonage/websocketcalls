@@ -11,7 +11,7 @@ const { DEMOS, detectDemoFromText, resolveDemo } = require('./lib/demoRouter');
 const { getTrackPreviewUrl, getPlaylistTracks } = require('./lib/spotifyApi');
 const spotifyOAuth = require('./lib/spotifyOAuth');
 const { searchVideoId } = require('./lib/youtubeApi');
-const { buildRingtoneClip, isCached: isRingtoneCached } = require('./lib/ringtoneBuilder');
+const { buildRingtoneClip, buildGeneratedRingtoneClip, isCached: isRingtoneCached } = require('./lib/ringtoneBuilder');
 const { handleAnswer, handleEvents } = require('./lib/voiceHandlers');
 const { handleDlr } = require('./lib/dlrHandler');
 const { attachVoiceBridge } = require('./lib/realtimeBridge');
@@ -546,6 +546,11 @@ app.get('/api/spotify-callback', async (req, res) => {
 // follow-up feature") ---
 app.get('/music-lovers/ringtone/:trackId.ogg', async (req, res) => {
   const { trackId } = req.params;
+  // Sent along by lib/musicLoversFlow.js's sendRingtone as a query param —
+  // this route only gets the trackId from the URL path, and the fallback
+  // path below (no Spotify preview available) needs to know which genre's
+  // instrumental to generate. See lib/elevenLabsMusic.js.
+  const genre = typeof req.query.genre === 'string' ? req.query.genre : null;
   try {
     // Skip the Spotify preview-URL lookup entirely on a cache hit — this
     // route previously always did that fetch first even when the clip was
@@ -556,11 +561,22 @@ app.get('/music-lovers/ringtone/:trackId.ogg', async (req, res) => {
       clip = await buildRingtoneClip(trackId, null);
     } else {
       const previewUrl = await getTrackPreviewUrl(trackId);
-      if (!previewUrl) {
-        res.status(404).send('No Spotify preview available for this track (see lib/spotifyApi.js) — needs a royalty-free fallback clip, not yet built.');
+      if (previewUrl) {
+        clip = await buildRingtoneClip(trackId, previewUrl);
+      } else if (genre) {
+        // Spotify restricted preview_url for standard API access around
+        // late 2024 — as of Sept 2026 this is the common case, not a rare
+        // one, confirmed live (see demo-notes.md). Generate a royalty-free
+        // genre-matched instrumental instead of the real song.
+        clip = await buildGeneratedRingtoneClip(trackId, genre);
+        if (!clip) {
+          res.status(502).send('Failed to generate a fallback ringtone clip via the ElevenLabs Music API (see lib/elevenLabsMusic.js) — check ELEVENLABS_API_KEY and server logs.');
+          return;
+        }
+      } else {
+        res.status(404).send('No Spotify preview available for this track, and no genre was supplied to generate a fallback clip.');
         return;
       }
-      clip = await buildRingtoneClip(trackId, previewUrl);
     }
     res.set('Content-Type', 'audio/ogg');
     res.send(clip);
