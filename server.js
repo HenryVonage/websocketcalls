@@ -596,9 +596,24 @@ app.get('/', (req, res) => {
 // this number's WABA" from real data instead of guesswork. Pass the WABA
 // id from Vonage's dashboard (Messages API -> External Accounts) as
 // ?waba=<id>. Returns only template metadata (name/language/status/
-// category), nothing sensitive.
+// category) by default, nothing sensitive.
+//
+// Sept 2026: added an optional ?name=<template name> filter that, for
+// matching templates only, also returns the full `components` array
+// (header/body/button shapes, variable counts, button sub_types) straight
+// from Vonage/Meta's own record — settles "does henry_ticketing2 really
+// have a button, and what type" from real data instead of a screenshot.
+// Added after two different image attachments of that template's design
+// failed to actually come through in chat (both a first attempt and a
+// follow-up "Other" free-text reply) — this route is a self-serve
+// alternative that doesn't depend on an attachment landing correctly, same
+// spirit as the existing catalog-refresh diagnostic route below. Every
+// component field Vonage/Meta returns is included verbatim for a matched
+// template (still nothing account-sensitive — just this template's own
+// approved shape), unlike the trimmed summary used for the unfiltered list.
 app.get('/admin/whatsapp-templates', requireAdminToken, async (req, res) => {
   const wabaId = req.query.waba;
+  const nameFilter = req.query.name;
   if (!wabaId) {
     res.status(400).json({ error: 'Pass the WABA id as ?waba=<id> (find it in the Vonage dashboard under Messages API -> External Accounts).' });
     return;
@@ -626,7 +641,11 @@ app.get('/admin/whatsapp-templates', requireAdminToken, async (req, res) => {
         return;
       }
       for (const t of (body.templates || [])) {
-        templates.push({ name: t.name, language: t.language, status: t.status, category: t.category });
+        if (nameFilter && t.name === nameFilter) {
+          templates.push(t); // full record, including components — name matched explicitly
+        } else if (!nameFilter) {
+          templates.push({ name: t.name, language: t.language, status: t.status, category: t.category });
+        }
       }
       after = body.paging?.cursors?.after || null;
       if (!after || !body.paging?.next) break;
