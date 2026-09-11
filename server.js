@@ -23,9 +23,11 @@ const {
   getSpotifyTokens,
   setTopTracksCatalogForGenre,
   getAllTopTracksCatalog,
+  getMusicTicketByKey,
   initStore,
 } = require('./lib/store');
 const { renderSummaryPdf } = require('./lib/pdfSummary');
+const { renderTicketPdf } = require('./lib/pdfTicket');
 const { getRecentEvents } = require('./lib/activityLog');
 const { generateRcsDeeplink, addRcsTestDevice, listRcsAgents } = require('./lib/vonageApi');
 const { logEvent, redactPhone } = require('./lib/activityLog');
@@ -436,6 +438,32 @@ app.get('/call-summary/:conversationUuid.pdf', async (req, res) => {
     res.send(pdfBuffer);
   } catch (err) {
     console.error('Failed to render call summary PDF:', err);
+    res.status(500).send('Failed to generate PDF');
+  }
+});
+
+// --- Fake per-artist concert ticket PDF (Sept 2026, Music Lovers inbound
+// call ticketing — see voiceHandlers.js's sendMusicLoversCallFollowUp).
+// henry_ticketing2's own header is the Music Lovers hero image, not this
+// PDF — this is a standalone fetchable URL for the ticket itself, so a
+// "My tickets over WhatsApp" button (once its real component shape is
+// confirmed — see /admin/whatsapp-templates above) or a plain shared link
+// can point a caller straight at it. Keyed by the opaque ticketKey
+// generated alongside the order number, not the phone number or the order
+// number shown in the template body — see store.js's setMusicTicketDetails
+// comment for why. ---
+app.get('/music-lovers/ticket/:ticketKey.pdf', async (req, res) => {
+  const ticket = getMusicTicketByKey(req.params.ticketKey);
+  if (!ticket) {
+    res.status(404).send('Ticket not found (expired, not yet generated, or server restarted).');
+    return;
+  }
+  try {
+    const pdfBuffer = await renderTicketPdf(ticket);
+    res.set('Content-Type', 'application/pdf');
+    res.send(pdfBuffer);
+  } catch (err) {
+    console.error('Failed to render ticket PDF:', err);
     res.status(500).send('Failed to generate PDF');
   }
 });
