@@ -517,15 +517,23 @@ app.get('/api/spotify-auth-start', (req, res) => {
 
 app.get('/api/spotify-callback', async (req, res) => {
   const { code, error, state } = req.query;
-  const pageBase = process.env.MUSIC_LOVERS_PAGE_URL || 'https://henryvonage.github.io/frontend/music-lovers.html';
+  // Sept 2026: Music Lovers no longer has its own dedicated page — it's
+  // now a family card inside demo.html's "Try a Demo" picker (see
+  // frontend/demo.html's DEMOS array, id 'henry-music-lovers'), so this
+  // redirects there with ?demo= preselecting it instead of to the
+  // retired music-lovers.html. withSpotifyStatus() below appends
+  // &spotify=... (not ?spotify=...) since pageBase already carries its
+  // own ?demo= query param.
+  const pageBase = process.env.MUSIC_LOVERS_PAGE_URL || 'https://henryvonage.github.io/frontend/demo.html?demo=henry-music-lovers';
+  const withSpotifyStatus = (status) => `${pageBase}${pageBase.includes('?') ? '&' : '?'}spotify=${status}`;
   if (error) {
     logEvent('inbound', `Spotify consent declined: ${error}`);
-    res.redirect(`${pageBase}?spotify=denied`);
+    res.redirect(withSpotifyStatus('denied'));
     return;
   }
   const pending = state && spotifyOAuth.consumePendingState(String(state));
   if (!pending) {
-    res.redirect(`${pageBase}?spotify=expired`);
+    res.redirect(withSpotifyStatus('expired'));
     return;
   }
   const isOwnerAuth = pending.phone === spotifyOAuth.OWNER_KEY;
@@ -554,7 +562,7 @@ app.get('/api/spotify-callback', async (req, res) => {
     // blank onrender.com page mid-demo. handleSpotifyConnected already has
     // its own try/catch and a fallback to the ordinary genre prompt, so
     // firing it without awaiting is safe.
-    res.redirect(`${pageBase}?spotify=connected`);
+    res.redirect(withSpotifyStatus('connected'));
     handleSpotifyConnected(pending.phone, pending.name || 'there').catch((err) => {
       console.error('handleSpotifyConnected (post-redirect) failed:', err);
     });
@@ -564,7 +572,7 @@ app.get('/api/spotify-callback', async (req, res) => {
       res.status(500).send('Spotify owner authorization failed — check the Render logs and try again.');
       return;
     }
-    res.redirect(`${pageBase}?spotify=error`);
+    res.redirect(withSpotifyStatus('error'));
   }
 });
 
