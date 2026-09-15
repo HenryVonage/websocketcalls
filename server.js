@@ -29,7 +29,7 @@ const {
 const { renderSummaryPdf } = require('./lib/pdfSummary');
 const { renderTicketPdf } = require('./lib/pdfTicket');
 const { getRecentEvents } = require('./lib/activityLog');
-const { generateRcsDeeplink, addRcsTestDevice, listRcsAgents } = require('./lib/vonageApi');
+const { generateRcsDeeplink, addRcsTestDevice, listRcsAgents, checkRcsDeviceCapability } = require('./lib/vonageApi');
 const { logEvent, redactPhone } = require('./lib/activityLog');
 const config = require('./lib/businessConfig');
 const multer = require('multer');
@@ -420,6 +420,38 @@ app.post('/api/rcs-test-device', testerDeviceLimiter, async (req, res) => {
     res.json({ ok: true, raw: result.json });
   } catch (err) {
     console.error('POST /api/rcs-test-device error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- Debug-only: check whether a number is actually reachable over RCS by
+// our test agent yet, per Vonage's device capability check (Henry's Sept
+// 2026 question — does registering a test device (POST /api/rcs-test-device
+// above) mean it can be messaged, or does it still need to accept Google's
+// SMS "make me a tester" invite first?). Deliberately admin-gated and kept
+// OFF the public frontend for now: Vonage's docs don't explicitly confirm
+// this distinguishes "never registered" from "registered but invite not yet
+// accepted" (see vonageApi.js's checkRcsDeviceCapability comment) — this
+// route exists so we can test it against a real pending-invite number (e.g.
+// the friend's number from the Sept 15 test) before deciding whether it's
+// reliable enough to surface to visitors on the demo page.
+app.get('/api/rcs-device-capability', requireAdminToken, async (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  try {
+    const raw = String(req.query.phone || '').trim();
+    if (!raw) {
+      res.status(400).json({ error: 'phone query param is required' });
+      return;
+    }
+    const phoneNumber = normalizeToE164(raw, config.RCS_DEEPLINK_COUNTRY);
+    const result = await checkRcsDeviceCapability({
+      senderId: config.RCS_AGENT_SENDER_ID,
+      phoneNumber,
+      country: req.query.country || config.RCS_DEEPLINK_COUNTRY,
+    });
+    res.status(result.ok ? 200 : 502).json(result.json);
+  } catch (err) {
+    console.error('GET /api/rcs-device-capability error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
