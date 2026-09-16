@@ -29,7 +29,7 @@ const {
 const { renderSummaryPdf } = require('./lib/pdfSummary');
 const { renderTicketPdf } = require('./lib/pdfTicket');
 const { getRecentEvents } = require('./lib/activityLog');
-const { generateRcsDeeplink, addRcsTestDevice, listRcsAgents, checkRcsDeviceCapability } = require('./lib/vonageApi');
+const { generateRcsDeeplink, addRcsTestDevice, listRcsAgents, checkRcsDeviceCapability, getRcsTestDevices } = require('./lib/vonageApi');
 const { logEvent, redactPhone } = require('./lib/activityLog');
 const config = require('./lib/businessConfig');
 const multer = require('multer');
@@ -142,6 +142,20 @@ const publicApiLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many requests. Please try again shortly.' },
+});
+
+// 90 per minute per IP: demo.html's startTesterPolling() checks this once
+// a second while waiting for a tester to accept their SMS invite (Henry's
+// Sept 2026 request), which is ~60/min from one visitor — headroom above
+// that for a couple of concurrent demo visitors behind the same IP
+// (office wifi, a shared venue network), while still capping abuse of an
+// otherwise-public, unauthenticated route.
+const rcsStatusPollLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 90,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many status checks. Please slow down.' },
 });
 
 // 5 per 15 min per IP — this endpoint sends a real email to Henry's inbox
@@ -424,17 +438,17 @@ app.post('/api/rcs-test-device', testerDeviceLimiter, async (req, res) => {
   }
 });
 
-// --- Debug-only: check whether a number is actually reachable over RCS by
-// our test agent yet, per Vonage's device capability check (Henry's Sept
-// 2026 question — does registering a test device (POST /api/rcs-test-device
-// above) mean it can be messaged, or does it still need to accept Google's
-// SMS "make me a tester" invite first?). Deliberately admin-gated and kept
-// OFF the public frontend for now: Vonage's docs don't explicitly confirm
-// this distinguishes "never registered" from "registered but invite not yet
-// accepted" (see vonageApi.js's checkRcsDeviceCapability comment) — this
-// route exists so we can test it against a real pending-invite number (e.g.
-// the friend's number from the Sept 15 test) before deciding whether it's
-// reliable enough to surface to visitors on the demo page.
+// --- Debug-only: Vonage's device/carrier RCS capability check (Henry's
+// Sept 2026 question — does registering a test device (POST
+// /api/rcs-test-device above) mean it can be messaged, or does it still
+// need to accept Google's SMS "make me a tester" invite first?). Turned
+// out NOT to answer that question at all — confirmed this is a generic
+// "can this OS+network support RCS" probe, unrelated to our agent's
+// tester list (see vonageApi.js's checkRcsDeviceCapability comment for
+// the full story). /api/rcs-test-device/status below, backed by the real
+// v2 tester-list endpoint, is what actually answers tester status now.
+// Left as an admin-gated diagnostic in case a genuine device-capability
+// question comes up later — never wired into the public frontend.
 app.get('/api/rcs-device-capability', requireAdminToken, async (req, res) => {
   res.set('Access-Control-Allow-Origin', '*');
   try {
@@ -454,6 +468,56 @@ app.get('/api/rcs-device-capability', requireAdminToken, async (req, res) => {
     console.error('GET /api/rcs-device-capability error:', err.message);
     res.status(500).json({ error: err.message });
   }
+});
+
+// --- Public: has this number actually accepted becoming an RCS tester yet?
+// (demo.html's startTesterPolling(), Henry's Sept 2026 request) ---
+// Backed by Vonage's real v2 tester-list endpoint (GET .../test-devices),
+// confirmed live against our own agent — not the device capability check
+// above, which turned out to answer a completely different question (see
+// that route's comment, and vonageApi.js's checkRcsDeviceCapability). A
+// live call returned:
+//   { "testers": [ { "id": "447463223250", "phone": "+447463223250",
+//                     "status": "ACCEPTED" }, ... ] }
+// Every tester seen so far was already "ACCEPTED", so a freshly-registered,
+// not-yet-accepted number's exact status string is still unconfirmed —
+// this deliberately checks for an "ACCEPTED" match rather than assuming
+// what a "not yet" value looks like, so any other status (or no match at
+// all, e.g. the list hasn't caught up with a registration yet) safely
+// reads as not ready rather than crashing or false-positiving on a typo'd
+// guess. Deliberately a separate, unauthenticated route rather than
+// reusing the admin-gated one above — an admin token can't safely live in
+// client-side JS. Always responds 200 with {ready:false} on any upstream
+// hiccup (missing phone aside) rather than a 4xx/5xx, so the frontend's
+// poll loop can treat "not ready yet" and "couldn't check right now" the
+// same way without special-casing either.
+app.get('/api/rcs-test-device/status', rcsStatusPollLimiter, async (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  const raw = String(req.query.phone || '').trim();
+  if (!raw) {
+    res.status(400).json({ error: 'phone query param is required' });
+    return;
+  }
+  try {
+    // normalizeNumber alone won't turn a UK 0-prefixed number into +44 —
+    // route it through normalizeToE164 first (same as every other RCS
+    // route here) so "07463223250" still matches the "+447463223250"
+    // Vonage's tester list actually has on file.
+    const phoneDigits = normalizeNumber(normalizeToE164(raw, config.RCS_DEEPLINK_COUNTRY));
+    const result = await getRcsTestDevices({ agentId: config.RCS_AGENT_ID_CM });
+    const testers = Array.isArray(result.json?.testers) ? result.json.testers : [];
+    const match = testers.find((t) => normalizeNumber(t.phone || t.id) === phoneDigits);
+    res.json({ ready: !!match && match.status === 'ACCEPTED' });
+  } catch (err) {
+    console.error('GET /api/rcs-test-device/status error:', err.message);
+    res.json({ ready: false });
+  }
+});
+app.options('/api/rcs-test-device/status', (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type');
+  res.status(204).end();
 });
 
 // --- Post-call recap PDF, fetched by WhatsApp for the henry_callrecap
