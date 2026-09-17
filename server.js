@@ -28,9 +28,8 @@ const {
 } = require('./lib/store');
 const { renderSummaryPdf } = require('./lib/pdfSummary');
 const { renderTicketPdf } = require('./lib/pdfTicket');
-const { getRecentEvents } = require('./lib/activityLog');
 const { generateRcsDeeplink, addRcsTestDevice, listRcsAgents, checkRcsDeviceCapability, getRcsTestDevices } = require('./lib/vonageApi');
-const { logEvent, redactPhone } = require('./lib/activityLog');
+const { logEvent, redactPhone, getEventsForPhone, getAllEventsForAdmin } = require('./lib/activityLog');
 const config = require('./lib/businessConfig');
 const multer = require('multer');
 const { sendFeedbackEmail, isValidEmail, sendSpotifyTesterRequestEmail } = require('./lib/feedbackMailer');
@@ -267,12 +266,39 @@ app.post('/events', handleEvents);
 // --- Delivery receipts (DLR Status Handler) ---
 app.post('/vonage-dlr-status', handleDlr);
 
-// --- Public, redacted activity feed for the demo frontend's logs page ---
-// (CORS-open since it's fetched cross-origin from GitHub Pages; safe to be
-// public since entries are pre-redacted at the point they're logged.)
+// --- Redacted activity feed for the demo frontend's logs page ---
+// (CORS-open since it's fetched cross-origin from GitHub Pages.)
+//
+// Sept 2026 (Henry): used to return every visitor's activity to anyone who
+// opened the page — fine for the redacted phone digits, but it meant a
+// stranger could watch every OTHER visitor's live activity too, not just
+// their own. Now scoped: a visitor passes their OWN number (?phone=...) and
+// gets back only events tied to that number; Henry passes his ADMIN_TOKEN
+// (?admin_token=... or X-Admin-Token, same convention as the other
+// diagnostic routes above) and gets everything, same as before. Neither
+// path ever returns the raw phone field logEvent() stores internally for
+// matching — see lib/activityLog.js.
+//
+// Note this is "know the number, see the log", not real per-visitor
+// authentication — nothing here verifies the caller actually owns the
+// phone they typed in. Acceptable for a pre-sales demo tool; not a pattern
+// to reuse anywhere real auth is needed.
 app.get('/api/logs', publicApiLimiter, (req, res) => {
   res.set('Access-Control-Allow-Origin', '*');
-  res.json({ events: getRecentEvents() });
+
+  const configuredAdminToken = process.env.ADMIN_TOKEN;
+  const suppliedAdminToken = req.query.admin_token || req.headers['x-admin-token'];
+  if (configuredAdminToken && suppliedAdminToken === configuredAdminToken) {
+    res.json({ events: getAllEventsForAdmin(), scope: 'all' });
+    return;
+  }
+
+  const phone = String(req.query.phone || '').trim();
+  if (!phone) {
+    res.status(400).json({ error: 'Pass your own phone number as ?phone= to see your activity (e.g. the number you used to try the demo).' });
+    return;
+  }
+  res.json({ events: getEventsForPhone(phone), scope: 'own' });
 });
 
 // --- RCS launch redirect for the demo frontend's QR code / Open button ---
@@ -425,7 +451,8 @@ app.post('/api/rcs-test-device', testerDeviceLimiter, async (req, res) => {
     });
     logEvent(
       result.ok ? 'call' : 'dlr',
-      `RCS test-device registration for ${redactPhone(phoneNumber)}: ${result.ok ? 'accepted' : `failed (${result.status})`}`
+      `RCS test-device registration for ${redactPhone(phoneNumber)}: ${result.ok ? 'accepted' : `failed (${result.status})`}`,
+      phoneNumber
       );
     if (!result.ok) {
       res.status(502).json({ error: 'Vonage Channel Manager API error', details: result.json });
@@ -649,7 +676,7 @@ app.get('/api/spotify-callback', async (req, res) => {
       return;
     }
     if (pending.name) setCallerName(pending.phone, pending.name);
-    logEvent('inbound', `Spotify connected for ${redactPhone(pending.phone)}`);
+    logEvent('inbound', `Spotify connected for ${redactPhone(pending.phone)}`, pending.phone);
     // Redirect the visitor's browser back to music-lovers.html immediately
     // — every other webhook/callback in this codebase acks/responds first
     // and does its own follow-up work after, but this one previously
@@ -961,7 +988,7 @@ app.post('/api/spotify-tester-request', spotifyTesterLimiter, async (req, res) =
     }
     const phone = rawPhone ? normalizeToE164(rawPhone, config.RCS_DEEPLINK_COUNTRY).replace(/^\+/, '') : '';
     await sendSpotifyTesterRequestEmail({ name, email, phone });
-    logEvent('inbound', `Spotify tester access requested by ${email}${phone ? ` (${redactPhone(phone)})` : ''}`);
+    logEvent('inbound', `Spotify tester access requested by ${email}${phone ? ` (${redactPhone(phone)})` : ''}`, phone);
     res.status(200).json({ status: 'received' });
   } catch (err) {
     console.error('POST /api/spotify-tester-request error:', err.message);
