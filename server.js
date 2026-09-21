@@ -6,7 +6,7 @@ const rateLimit = require('express-rate-limit');
 const { handleWhatsAppInbound } = require('./lib/whatsappFlow');
 const { processTicketingWhatsapp, TICKETING_REPLY_IDS } = require('./lib/ticketingWhatsappFlow');
 const { handleMusicLoversInbound, handleSpotifyConnected } = require('./lib/musicLoversFlow');
-const { buildAndSendMix, renderTeaserForSet } = require('./lib/musicLoversMix');
+const { buildAndSendMix, renderTeaserForSet, renderArcForSet } = require('./lib/musicLoversMix');
 const { handleRcsInbound } = require('./lib/rcsFlow');
 const { DEMOS, detectDemoFromText, resolveDemo } = require('./lib/demoRouter');
 const { getTrackPreviewUrl, getPlaylistTracks } = require('./lib/spotifyApi');
@@ -787,6 +787,29 @@ app.get('/music-lovers/mix-teaser/:setId.ogg', async (req, res) => {
   } catch (err) {
     console.error('Failed to render Music Lovers mix teaser:', err);
     res.status(500).send('Failed to render mix teaser');
+  }
+});
+
+// --- Music Lovers "Personal DJ mix" arc chart (PNG), fetched by WhatsApp
+// for the image message sent right after the set sheet. Same cold-render
+// fallback as the teaser route above. ---
+app.get('/music-lovers/mix-arc/:setId.png', (req, res) => {
+  const setId = String(req.params.setId || '');
+  if (!/^[0-9a-f-]{36}$/i.test(setId)) {
+    res.status(400).send('Bad set id.');
+    return;
+  }
+  try {
+    const png = renderArcForSet(setId);
+    if (!png) {
+      res.status(404).send('No mix on file for this id (it may have expired).');
+      return;
+    }
+    res.set('Content-Type', 'image/png');
+    res.send(png);
+  } catch (err) {
+    console.error('Failed to render Music Lovers mix arc chart:', err);
+    res.status(500).send('Failed to render mix arc chart');
   }
 });
 
