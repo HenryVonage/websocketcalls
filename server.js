@@ -6,6 +6,7 @@ const rateLimit = require('express-rate-limit');
 const { handleWhatsAppInbound } = require('./lib/whatsappFlow');
 const { processTicketingWhatsapp, TICKETING_REPLY_IDS } = require('./lib/ticketingWhatsappFlow');
 const { handleMusicLoversInbound, handleSpotifyConnected } = require('./lib/musicLoversFlow');
+const { buildAndSendMix, renderTeaserForSet } = require('./lib/musicLoversMix');
 const { handleRcsInbound } = require('./lib/rcsFlow');
 const { DEMOS, detectDemoFromText, resolveDemo } = require('./lib/demoRouter');
 const { getTrackPreviewUrl, getPlaylistTracks } = require('./lib/spotifyApi');
@@ -629,9 +630,13 @@ app.get('/api/spotify-auth-start', (req, res) => {
     return;
   }
   const phone = normalizeToE164(rawPhone, config.RCS_DEEPLINK_COUNTRY).replace(/^\+/, '');
+  // ?mix=1 — visitor also ticked "build me a 1-hour DJ mix" on demo.html:
+  // widens the Spotify consent to playlist read + private-playlist write
+  // and triggers lib/musicLoversMix.js after the callback below.
+  const wantMix = req.query.mix === '1';
   try {
-    const state = spotifyOAuth.createPendingState(phone, name);
-    res.redirect(spotifyOAuth.getAuthorizeUrl(state));
+    const state = spotifyOAuth.createPendingState(phone, name, { wantMix });
+    res.redirect(spotifyOAuth.getAuthorizeUrl(state, { wantMix }));
   } catch (err) {
     console.error('Spotify auth-start failed:', err.message);
     res.status(500).send('Spotify connect is not configured yet (missing SPOTIFY_CLIENT_ID / SPOTIFY_REDIRECT_URI) — see .env.example.');
@@ -685,10 +690,24 @@ app.get('/api/spotify-callback', async (req, res) => {
     // blank onrender.com page mid-demo. handleSpotifyConnected already has
     // its own try/catch and a fallback to the ordinary genre prompt, so
     // firing it without awaiting is safe.
-    res.redirect(withSpotifyStatus('connected'));
-    handleSpotifyConnected(pending.phone, pending.name || 'there').catch((err) => {
-      console.error('handleSpotifyConnected (post-redirect) failed:', err);
-    });
+    res.redirect(withSpotifyStatus(pending.wantMix ? 'connected-mix' : 'connected'));
+    handleSpotifyConnected(pending.phone, pending.name || 'there')
+      .catch((err) => {
+        console.error('handleSpotifyConnected (post-redirect) failed:', err);
+      })
+      .then(() => {
+        // Personal DJ mix (lib/musicLoversMix.js) runs AFTER the matched
+        // track has gone out, so the listener's first message is still
+        // the instant one; the mix itself takes a minute or two and
+        // announces itself on WhatsApp before it starts.
+        if (pending.wantMix) {
+          return buildAndSendMix(pending.phone, pending.name || 'there');
+        }
+        return undefined;
+      })
+      .catch((err) => {
+        console.error('buildAndSendMix (post-redirect) failed:', err);
+      });
   } catch (err) {
     console.error('Spotify OAuth callback failed:', err.message);
     if (isOwnerAuth) {
@@ -742,6 +761,32 @@ app.get('/music-lovers/ringtone/:trackId.ogg', async (req, res) => {
   } catch (err) {
     console.error('Failed to build Music Lovers ringtone clip:', err);
     res.status(500).send('Failed to generate ringtone clip');
+  }
+});
+
+// --- Music Lovers "Personal DJ mix" teaser, fetched by WhatsApp for the
+// audio message lib/musicLoversMix.js sends after the tracklist. The
+// render is normally already cached (prewarmed before the send, same
+// trick as the ringtone route above); a cold hit (Render restart in
+// between) re-renders from the stored plan. setId is a random UUID, so
+// the URL leaks nothing about the listener. ---
+app.get('/music-lovers/mix-teaser/:setId.ogg', async (req, res) => {
+  const setId = String(req.params.setId || '');
+  if (!/^[0-9a-f-]{36}$/i.test(setId)) {
+    res.status(400).send('Bad set id.');
+    return;
+  }
+  try {
+    const clip = await renderTeaserForSet(setId);
+    if (!clip) {
+      res.status(404).send('No mix on file for this id (it may have expired).');
+      return;
+    }
+    res.set('Content-Type', 'audio/ogg');
+    res.send(clip);
+  } catch (err) {
+    console.error('Failed to render Music Lovers mix teaser:', err);
+    res.status(500).send('Failed to render mix teaser');
   }
 });
 
