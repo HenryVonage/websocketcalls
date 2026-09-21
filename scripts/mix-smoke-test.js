@@ -3,7 +3,7 @@
 // everything EXCEPT Spotify OAuth and WhatsApp, so it needs no tokens:
 //   iTunes preview lookup → BPM/key analysis → set planning → teaser render.
 //
-//   node scripts/mix-smoke-test.js               # built-in 12-track sample
+//   node scripts/mix-smoke-test.js               # built-in 12-track sample (title+artist search, no ISRC)
 //   node scripts/mix-smoke-test.js my-tracks.csv  # Exportify CSV (Track Name, Artist Name(s)…)
 //
 // Writes the teaser to /tmp/mix-teaser.ogg (open it with QuickTime/VLC) and
@@ -11,22 +11,22 @@
 // honoured if set in the environment. Network: itunes.apple.com only.
 const fs = require('fs');
 const { getFeaturesForMany } = require('../lib/trackFeatures');
-const { planSet, formatClock } = require('../lib/mixEngine');
+const { planSet, formatClock, keyName } = require('../lib/mixEngine');
 const { buildTeaser } = require('../lib/mixTeaser');
 
 const SAMPLE = [
-  ['Music Sounds Better With You', 'Stardust', 'FRZ019800001'],
-  ['Lady - Hear Me Tonight', 'Modjo', 'FRZ010000007'],
-  ['Around the World', 'Daft Punk', 'GBDUW0600005'],
-  ['Poison Lips', 'Vitalic', 'FR6V80900520'],
-  ['Losing It', 'FISHER', 'AUUM71800019'],
-  ['Glue', 'Bicep', 'GBCFB1700230'],
-  ['Sky and Sand', 'Paul Kalkbrenner', 'DEJ360800025'],
-  ['Inspector Norse', 'Todd Terje', 'NOTOD1200001'],
-  ['Cola', 'CamelPhat', 'GBCEN1700236'],
-  ['Hey Boy Hey Girl', 'The Chemical Brothers', 'GBAAA9900081'],
-  ['Genesis', 'Justice', 'FR9W10700124'],
-  ['D.A.N.C.E.', 'Justice', 'FR9W10700125'],
+  ['Music Sounds Better With You', 'Stardust'],
+  ['Lady - Hear Me Tonight', 'Modjo'],
+  ['Around the World', 'Daft Punk'],
+  ['Poison Lips', 'Vitalic'],
+  ['Losing It', 'FISHER'],
+  ['Glue', 'Bicep'],
+  ['Sky and Sand', 'Paul Kalkbrenner'],
+  ['Inspector Norse', 'Todd Terje'],
+  ['Cola', 'CamelPhat'],
+  ['Hey Boy Hey Girl', 'The Chemical Brothers'],
+  ['Genesis', 'Justice'],
+  ['D.A.N.C.E.', 'Justice'],
 ];
 
 function parseCsv(file) {
@@ -64,7 +64,7 @@ function parseCsv(file) {
 (async () => {
   const input = process.argv[2]
     ? parseCsv(process.argv[2]).slice(0, +process.env.MAX_TRACKS || 60)
-    : SAMPLE.map(([title, artist, isrc], i) => ({ id: `s${i}`, title, artist, isrc, durationSec: 300, highlight: 0 }));
+    : SAMPLE.map(([title, artist], i) => ({ id: `s${i}`, title, artist, isrc: null, durationSec: 300, highlight: 0 }));
   console.log(`Looking up ${input.length} tracks (iTunes previews + analysis)…`);
   const t0 = Date.now();
   const analysed = await getFeaturesForMany(input, {
@@ -72,7 +72,7 @@ function parseCsv(file) {
     onProgress: (d, n) => process.stdout.write(`\r  ${d}/${n}`),
   });
   console.log(`\n${analysed.length} analysed in ${((Date.now() - t0) / 1000).toFixed(1)} s`);
-  for (const t of analysed) console.log(`  ${String(t.bpm).padStart(6)} BPM  ${(t.keyName || '?').padEnd(4)} E${t.energy}  [${t.source}]  ${t.artist} – ${t.title}`);
+  for (const t of analysed) console.log(`  ${String(t.bpm).padStart(6)} BPM  ${(keyName(t.key, t.mode) || '?').padEnd(4)} E${t.energy}  [${t.source}]  ${t.artist} – ${t.title}`);
 
   const plan = planSet(analysed, { targetSec: +process.env.TARGET_SEC || 3600 });
   console.log(`\nPlanned set: ${plan.tracks.length} tracks, ${formatClock(plan.totalSec)}, median ${plan.medianBpm} BPM`);
