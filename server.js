@@ -1016,11 +1016,13 @@ app.get('/admin/music-lovers/top-tracks-catalog', requireAdminToken, (req, res) 
 // Run once after the owner authorization (which must have been done with
 // the current /api/spotify-auth-start?owner=1, i.e. with playlist scopes),
 // and again whenever Henry adds tracks — only new ones get analysed.
-// Returns the job status immediately; poll the same URL (or the /status
-// one) to watch done/total climb.
+// Returns the job status immediately; poll the /status route to watch
+// done/total climb (re-hitting this URL after a run starts a new one).
+// ?retry=1 first forgets cached "no preview" results for the library so
+// tracks lost to an iTunes throttle get looked up again.
 app.get('/admin/music-lovers/mix-preanalyse', requireAdminToken, async (req, res) => {
   try {
-    const status = await ownerLibrary.preanalyse();
+    const status = await ownerLibrary.preanalyse({ retryMissing: req.query.retry === '1' });
     logEvent('inbound', `Henry's library pre-analysis ${status.running ? 'running' : 'started'} (${status.done}/${status.total})`);
     res.status(200).json(status);
   } catch (err) {
