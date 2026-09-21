@@ -7,6 +7,7 @@ const { handleWhatsAppInbound } = require('./lib/whatsappFlow');
 const { processTicketingWhatsapp, TICKETING_REPLY_IDS } = require('./lib/ticketingWhatsappFlow');
 const { handleMusicLoversInbound, handleSpotifyConnected } = require('./lib/musicLoversFlow');
 const { buildAndSendMix, renderTeaserForSet, renderArcForSet } = require('./lib/musicLoversMix');
+const mixVibes = require('./lib/mixVibes');
 const { handleRcsInbound } = require('./lib/rcsFlow');
 const { DEMOS, detectDemoFromText, resolveDemo } = require('./lib/demoRouter');
 const { getTrackPreviewUrl, getPlaylistTracks } = require('./lib/spotifyApi');
@@ -634,8 +635,13 @@ app.get('/api/spotify-auth-start', (req, res) => {
   // widens the Spotify consent to playlist read + private-playlist write
   // and triggers lib/musicLoversMix.js after the callback below.
   const wantMix = req.query.mix === '1';
+  // Vibe + duration for the mix (lib/mixVibes.js validates; unknown values
+  // fall back to the house-party hour) — carried through the OAuth round
+  // trip in the pending state, never in Spotify's `state` param itself.
+  const mixVibe = mixVibes.vibeKey(req.query.vibe);
+  const mixDurationMin = mixVibes.normaliseDuration(req.query.duration);
   try {
-    const state = spotifyOAuth.createPendingState(phone, name, { wantMix });
+    const state = spotifyOAuth.createPendingState(phone, name, { wantMix, mixVibe, mixDurationMin });
     res.redirect(spotifyOAuth.getAuthorizeUrl(state, { wantMix }));
   } catch (err) {
     console.error('Spotify auth-start failed:', err.message);
@@ -701,7 +707,7 @@ app.get('/api/spotify-callback', async (req, res) => {
         // the instant one; the mix itself takes a minute or two and
         // announces itself on WhatsApp before it starts.
         if (pending.wantMix) {
-          return buildAndSendMix(pending.phone, pending.name || 'there');
+          return buildAndSendMix(pending.phone, pending.name || 'there', { vibe: pending.mixVibe, durationMin: pending.mixDurationMin });
         }
         return undefined;
       })
