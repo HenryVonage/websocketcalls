@@ -8,6 +8,7 @@ const { processTicketingWhatsapp, TICKETING_REPLY_IDS } = require('./lib/ticketi
 const { handleMusicLoversInbound, handleSpotifyConnected } = require('./lib/musicLoversFlow');
 const { buildAndSendMix, renderTeaserForSet, renderArcForSet } = require('./lib/musicLoversMix');
 const mixVibes = require('./lib/mixVibes');
+const ownerLibrary = require('./lib/ownerLibrary');
 const { handleRcsInbound } = require('./lib/rcsFlow');
 const { DEMOS, detectDemoFromText, resolveDemo } = require('./lib/demoRouter');
 const { getTrackPreviewUrl, getPlaylistTracks } = require('./lib/spotifyApi');
@@ -26,6 +27,7 @@ const {
   setTopTracksCatalogForGenre,
   getAllTopTracksCatalog,
   getMusicTicketByKey,
+  getMusicLoversState,
   initStore,
 } = require('./lib/store');
 const { renderSummaryPdf } = require('./lib/pdfSummary');
@@ -178,6 +180,16 @@ const spotifyTesterLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many requests from this device. Please try again in a few minutes.' },
+});
+
+// 4 per hour per device: each accepted request analyses tracks and sends
+// four WhatsApp messages from Henry's account (lib/musicLoversMix.js).
+const henryMixLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: 4,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'That is enough mixes for one hour from this device — please try again later.' },
 });
 
 // --- Feedback form uploads (photos/video attached to henryauthier@gmail.com) ---
@@ -617,7 +629,10 @@ app.get('/api/spotify-auth-start', (req, res) => {
     }
     try {
       const state = spotifyOAuth.createPendingState(spotifyOAuth.OWNER_KEY, 'Henry (catalog owner)');
-      res.redirect(spotifyOAuth.getAuthorizeUrl(state));
+      // MIX_SCOPES, not just user-top-read: the owner token also reads
+      // Henry's playlists and writes visitors' "from Henry's library"
+      // mixes as private playlists on his account (lib/ownerLibrary.js).
+      res.redirect(spotifyOAuth.getAuthorizeUrl(state, { wantMix: true }));
     } catch (err) {
       console.error('Spotify owner auth-start failed:', err.message);
       res.status(500).send('Spotify connect is not configured yet (missing SPOTIFY_CLIENT_ID / SPOTIFY_REDIRECT_URI) — see .env.example.');
@@ -683,7 +698,7 @@ app.get('/api/spotify-callback', async (req, res) => {
       // music-lovers.html and no WhatsApp match to trigger. Plain
       // confirmation is enough; the next step happens via the admin route.
       logEvent('inbound', 'Spotify connected as Music Lovers catalog owner (Henry)');
-      res.send('Spotify connected as the Music Lovers catalog owner. You can close this tab, then call GET /admin/music-lovers/refresh-top-tracks-catalog?admin_token=... to build the genre catalog from your last-4-weeks Top Tracks.');
+      res.send('Spotify connected as the Music Lovers catalog owner. You can close this tab, then call GET /admin/music-lovers/refresh-top-tracks-catalog?admin_token=... to build the genre catalog from your last-4-weeks Top Tracks, and GET /admin/music-lovers/mix-preanalyse?admin_token=... to pre-analyse your playlists for the "mix from Henry\'s library" option.');
       return;
     }
     if (pending.name) setCallerName(pending.phone, pending.name);
@@ -992,6 +1007,72 @@ app.get('/admin/music-lovers/refresh-top-tracks-catalog', requireAdminToken, asy
 // what's currently live without spending another refresh.
 app.get('/admin/music-lovers/top-tracks-catalog', requireAdminToken, (req, res) => {
   res.status(200).json({ genres: getAllTopTracksCatalog() });
+});
+
+// --- "Personal DJ mix from Henry's library" (lib/ownerLibrary.js) ---
+// Pre-analyses every track in Henry's own playlists (BPM / key / energy
+// via lib/trackFeatures.js, cached in store.js) as a background job, so
+// a visitor's "from Henry's library" mix is planned from cache in seconds.
+// Run once after the owner authorization (which must have been done with
+// the current /api/spotify-auth-start?owner=1, i.e. with playlist scopes),
+// and again whenever Henry adds tracks — only new ones get analysed.
+// Returns the job status immediately; poll the same URL (or the /status
+// one) to watch done/total climb.
+app.get('/admin/music-lovers/mix-preanalyse', requireAdminToken, async (req, res) => {
+  try {
+    const status = await ownerLibrary.preanalyse();
+    logEvent('inbound', `Henry's library pre-analysis ${status.running ? 'running' : 'started'} (${status.done}/${status.total})`);
+    res.status(200).json(status);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+app.get('/admin/music-lovers/mix-preanalyse/status', requireAdminToken, (req, res) => {
+  res.status(200).json(ownerLibrary.preanalyseStatus());
+});
+
+// The visitor-facing entry point for that option: no Spotify OAuth at
+// all — demo.html POSTs name + WhatsApp number + vibe + duration here and
+// lib/musicLoversMix.js does the rest with the owner token. The visitor
+// must already have messaged the WhatsApp number (the QR / wa.me link at
+// the top of the card) — the follow-ups are free-form WhatsApp messages,
+// which Meta only delivers inside that 24-hour window, so instead of
+// sending into the void we tell the page to have them say hi first.
+app.options('/api/music-lovers/henry-mix', (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type');
+  res.status(204).end();
+});
+app.post('/api/music-lovers/henry-mix', henryMixLimiter, (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  const name = String(req.body?.name || '').trim().slice(0, 60);
+  const rawPhone = String(req.body?.phone || '').trim();
+  if (!rawPhone) {
+    res.status(400).json({ error: 'A WhatsApp number is required.' });
+    return;
+  }
+  const phone = normalizeToE164(rawPhone, config.RCS_DEEPLINK_COUNTRY).replace(/^\+/, '');
+  if (!/^\d{8,15}$/.test(phone)) {
+    res.status(400).json({ error: 'Enter your number in international format, including the country code.' });
+    return;
+  }
+  if (!getSpotifyTokens(spotifyOAuth.OWNER_KEY)) {
+    res.status(503).json({ error: "Henry's library isn't connected on this server yet — try the \"my own Spotify\" option instead." });
+    return;
+  }
+  if (!Object.keys(getMusicLoversState(phone)).length) {
+    res.status(409).json({ error: 'Say hi to Henry on WhatsApp first (scan the QR code or tap Open above), then come back and tap this button again — WhatsApp only lets us reply inside a conversation you started.' });
+    return;
+  }
+  const vibe = mixVibes.vibeKey(req.body?.vibe);
+  const durationMin = mixVibes.normaliseDuration(req.body?.duration);
+  if (name) setCallerName(phone, name);
+  logEvent('inbound', `Mix from Henry's library requested by ${redactPhone(phone)} (${vibe}, ${durationMin} min)`, phone);
+  res.status(202).json({ status: 'started', vibe, durationMin });
+  buildAndSendMix(phone, name || 'there', { vibe, durationMin, source: 'henry' }).catch((err) => {
+    console.error('buildAndSendMix (henry-mix) failed:', err);
+  });
 });
 
 // --- Feedback form (bottom of demo.html — visitor comment/question,
